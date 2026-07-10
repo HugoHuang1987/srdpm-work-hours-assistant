@@ -1,0 +1,62 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local IDE and assistant state
+.vscode/
+.idea/
+.workbuddy/
+
+# Secrets and local configuration
+.env
+.env.*
+*credential*.json
+*credentials*.json
+*token*.json
+*cookie*.json
+srdpm_api_info.json
+srdpm_approve_api_discovery.json
+srdpm_approve_api_v2.json
+srdpm_approve_captured_*.json
+
+# Sensitive raw data, archives, reports, and logs
+srdpm_archive/
+**/raw_data.json
+**/audit_report.json
+**/audit_report.md
+srdpm_daily_data_*.json
+srdpm_data.json
+srdpm_all_data.json
+srdpm_approve_log_*.json
+confluence_page.json
+审核报告*.json
+审核报告*.md
+reject_result*.txt
+excel_dump*.txt
+
+# Internal spreadsheets and screenshots
+团队成员项目负荷*.xlsx
+申报不合理排查*.xlsx
+*.png
+
+# Generated dashboards and captured internal pages
+工时审批看板*.html
+工时看板*.html
+工时统计看板*.html
+srdpm_*.html
+
+# Legacy scripts that may access or mutate production
+legacy/
+legacy-quarantine/
+batch_approve_*.py
+test_approve_api*.py
+try_reject_api*.py
+discover_approve_api*.py
+verify_approve.py
+srdpm_api_capture.py
