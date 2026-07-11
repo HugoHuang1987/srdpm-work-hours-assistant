@@ -115,6 +115,44 @@ class DashboardUiTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assert_no_page_errors()
 
+    def test_platform_selected_rows_can_be_cancelled_in_platform_view(self):
+        self.page.locator("button[onclick='selectAllAutoGroups()']").click()
+        self.page.locator('.cat-nav-item[data-cat="five"]').click()
+
+        self.assertGreater(
+            self.page.locator("#panel_five .btn-approve.done").count(), 0
+        )
+        self.assertIn(
+            "取消本类选择",
+            self.page.locator("#panel_five .bulk-actions").inner_text(),
+        )
+
+        before = json.loads(
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+        )
+        self.assertEqual(len(before), 50)
+        self.page.locator("#panel_five .btn-approve.done").first.click()
+        after = json.loads(
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+        )
+        self.assertEqual(len(after), 49)
+        self.assertIn("已选49", self.page.locator("#pendingCount").inner_text())
+        self.assertEqual(
+            self.page.locator(".cat-nav-item.active").get_attribute("data-cat"), "five"
+        )
+
+        self.page.locator("#panel_five .bulk-actions button").filter(
+            has_text="取消本类选择"
+        ).click()
+        remaining_platform_selected = self.page.evaluate(
+            """groupKeysForCategory('five', false).filter(groupKey =>
+                APPROVAL_GROUPS[groupKey]?.review_mode === 'auto' &&
+                getGroupStatus(groupKey) === 'selected'
+            ).length"""
+        )
+        self.assertEqual(remaining_platform_selected, 0)
+        self.assert_no_page_errors()
+
     def test_reset_keeps_current_tab_and_never_dereferences_missing_active_node(self):
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
         self.page.locator("button[onclick='selectAllAutoGroups()']").click()

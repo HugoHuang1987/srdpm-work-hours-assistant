@@ -912,18 +912,19 @@ function getFilteredIndices(key) {
 
 function renderBulkActions(key) {
     if (!APPROVE_CATS.includes(key)) return "";
-    const groupKeys = groupKeysForCategory(key);
     const allViewGroupKeys = groupKeysForCategory(key, false);
-    const counts = deriveCounts(groupKeys);
-    const hasAutoPending = counts.auto.pending > 0;
-    const selectedCount = counts.auto.selected + counts.manual.selected;
+    const viewCounts = deriveCounts(allViewGroupKeys);
+    const hasAutoPending = viewCounts.auto.pending > 0;
+    const selectedCount = AUTO_CATS.includes(key)
+        ? viewCounts.auto.selected
+        : viewCounts.manual.selected;
     const routedManualCount = allViewGroupKeys.filter(groupKey => {
         const group = APPROVAL_GROUPS[groupKey];
         return group?.review_mode === "manual" && group.primary_category !== key;
     }).length;
     let html = '<div class="bulk-actions">';
     if (hasAutoPending) {
-        html += `<button class="btn-info" onclick="selectCategoryGroups('${key}', 'auto', true)">⭐ 全选本类自动候选（${counts.auto.pending}单）</button>`;
+        html += `<button class="btn-info" onclick="selectCategoryGroups('${key}', 'auto', true)">⭐ 全选本类自动候选（${viewCounts.auto.pending}单）</button>`;
     }
     if (selectedCount > 0) {
         html += `<button class="btn-info" onclick="clearCategorySelection('${key}')">取消本类选择（${selectedCount}单）</button>`;
@@ -938,7 +939,7 @@ function renderBulkActions(key) {
 }
 
 function selectCategoryGroups(catKey, reviewMode, selected) {
-    for (const groupKey of groupKeysForCategory(catKey)) {
+    for (const groupKey of groupKeysForCategory(catKey, false)) {
         const group = APPROVAL_GROUPS[groupKey];
         if (!group || group.review_mode !== reviewMode || group.status === "approved") continue;
         if (selected) approvalState[groupKey] = "selected";
@@ -961,7 +962,11 @@ function selectAllAutoGroups() {
 }
 
 function clearCategorySelection(catKey) {
-    for (const groupKey of groupKeysForCategory(catKey)) delete approvalState[groupKey];
+    for (const groupKey of groupKeysForCategory(catKey, false)) {
+        const group = APPROVAL_GROUPS[groupKey];
+        if (AUTO_CATS.includes(catKey) && group?.review_mode !== "auto") continue;
+        delete approvalState[groupKey];
+    }
     saveState();
     renderCategoryNav();
     switchTab(catKey);
@@ -1114,13 +1119,13 @@ function renderTable(key, cat) {
                 const primaryCategory = group.primary_category || key;
                 const isPrimaryView = primaryCategory === key;
                 const primaryTitle = (CAT_DATA[primaryCategory]?.title || "主分类").replace(/^.+?、/, "");
-                if (!isPrimaryView && status !== "approved") {
-                    tableHtml += `<td class="nowrap"><button class="btn-info" onclick="switchTab('${primaryCategory}')">前往${primaryTitle}</button></td>`;
-                } else if (status === "approved") {
+                if (status === "approved") {
                     tableHtml += `<td class="nowrap"><span style="color:#1a7a1a;font-size:13px;">✓ 服务器已通过</span></td>`;
                 } else if (status === "selected") {
                     const undoText = isManualGroup ? "撤销整单标记" : "取消整单选择";
                     tableHtml += `<td class="nowrap"><button class="btn-approve done" onclick="toggleApproval('${key}', ${i})">${undoText}</button></td>`;
+                } else if (!isPrimaryView && isManualGroup) {
+                    tableHtml += `<td class="nowrap"><button class="btn-info" onclick="switchTab('${primaryCategory}')">前往${primaryTitle}</button></td>`;
                 } else if (status === "info") {
                     tableHtml += '<td class="nowrap">无审批批次</td>';
                 } else {
