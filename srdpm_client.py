@@ -11,12 +11,15 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import requests
 
 
 LOGIN_URL = "https://rd-mokadisplay.tcl.com/srdpm/#/work-list"
 API_BASE = "https://rd-mokadisplay.tcl.com/srdpm-api/workload/approve"
+SRDPM_SCHEME = "https"
+SRDPM_HOST = "rd-mokadisplay.tcl.com"
 
 
 class SRDPMError(RuntimeError):
@@ -70,6 +73,40 @@ def _dedupe_ids(values: Iterable[Any]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _is_target_url(url: Any, path_prefix: str) -> bool:
+    """只接受 SRDPM 的精确 HTTPS 主机、默认端口和预期路径。"""
+
+    try:
+        parsed = urlsplit(str(url))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme.lower() == SRDPM_SCHEME
+        and (parsed.hostname or "").lower() == SRDPM_HOST
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.startswith(path_prefix)
+    )
+
+
+def _is_target_cookie_domain(value: Any) -> bool:
+    domain = str(value or "").strip().lower().lstrip(".").rstrip(".")
+    return domain == SRDPM_HOST
+
+
+def _normalize_user_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise APIError("user_id 不合法")
+    text = str(value).strip()
+    if not text or len(text) > 128 or any(ord(ch) < 32 for ch in text):
+        raise APIError("user_id 不合法")
+    return text
+
+
 @dataclass
 class SRDPMClient:
     """由环境变量创建、延迟登录的 SRDPM 客户端。"""
@@ -120,7 +157,7 @@ class SRDPMClient:
                 page = context.new_page()
 
                 def capture_token(request: Any) -> None:
-                    if "/srdpm-api/" not in request.url:
+                    if not _is_target_url(request.url, "/srdpm-api/"):
                         return
                     token = request.headers.get("accesstoken", "")
                     if token and "value" not in captured_token:
@@ -132,6 +169,8 @@ class SRDPMClient:
                     timeout=60_000,
                     wait_until="domcontentloaded",
                 )
+                if not _is_target_url(page.url, "/srdpm/"):
+                    raise AuthenticationError("SRDPM 登录页跳转到了非目标主机")
                 page.locator('input[name="username"]').fill(self._username)
                 page.locator('input[name="password"]').fill(self._password)
                 page.locator('button:has-text("登录")').click()
@@ -143,7 +182,14 @@ class SRDPMClient:
                     filter_button.first.click()
                     page.wait_for_timeout(3_000)
 
-                cookies = context.cookies()
+                if not _is_target_url(page.url, "/srdpm/"):
+                    raise AuthenticationError("SRDPM 登录后跳转到了非目标主机")
+
+                cookies = [
+                    cookie
+                    for cookie in context.cookies()
+                    if _is_target_cookie_domain(cookie.get("domain"))
+                ]
                 context.close()
                 browser.close()
         except Exception as exc:
@@ -200,6 +246,7 @@ class SRDPMClient:
                 json=dict(payload),
                 timeout=self.timeout_seconds,
                 verify=self.verify_tls,
+                allow_redirects=False,
             )
             response.raise_for_status()
             body = response.json()
@@ -216,13 +263,16 @@ class SRDPMClient:
             raise APIError(f"SRDPM API 返回失败状态：{path} code={body.get('code')}")
         return body
 
-    def _list_status(self, date: str, status: str) -> list[Mapping[str, Any]]:
+    def _list_status(
+        self, date: str, status: str, user_id: str | None = None
+    ) -> list[Mapping[str, Any]]:
         try:
             datetime.strptime(date, "%Y-%m-%d")
         except ValueError as exc:
             raise APIError(f"日期格式必须为 YYYY-MM-DD：{date}") from exc
         if status not in {"0", "2", "3"}:
             raise APIError(f"不允许查询审批状态：{status}")
+        normalized_user_id = _normalize_user_id(user_id)
 
         page = 1
         page_size = 200
@@ -236,7 +286,7 @@ class SRDPMClient:
                     "type": None,
                     "status": status,
                     "time": date,
-                    "user_id": None,
+                    "user_id": normalized_user_id,
                     "group_id": None,
                 },
             )
@@ -263,10 +313,24 @@ class SRDPMClient:
 
     @staticmethod
     def _children_for_person(
-        records: Sequence[Mapping[str, Any]], person: str
+        records: Sequence[Mapping[str, Any]],
+        person: str,
+        user_id: str | None = None,
     ) -> Iterable[Mapping[str, Any]]:
+        normalized_user_id = _normalize_user_id(user_id)
         for parent in records:
-            if str(parent.get("cn_name", "")).strip() != person:
+            if normalized_user_id is not None:
+                parent_ids = {
+                    str(parent.get(field)).strip()
+                    for field in ("uid", "user_id")
+                    if parent.get(field) is not None
+                    and str(parent.get(field)).strip()
+                }
+                if len(parent_ids) > 1:
+                    raise APIError("SRDPM 人员记录中的 uid/user_id 冲突")
+                if normalized_user_id not in parent_ids:
+                    continue
+            elif str(parent.get("cn_name", "")).strip() != person:
                 continue
             children = parent.get("children", [])
             if not isinstance(children, list):
@@ -276,12 +340,15 @@ class SRDPMClient:
                     raise APIError("SRDPM child 结构异常")
                 yield child
 
-    def get_pending_ids(self, person: str, date: str) -> tuple[str, ...]:
+    def get_pending_ids(
+        self, person: str, date: str, user_id: str | None = None
+    ) -> tuple[str, ...]:
         """从 status=0 的实时结果中提取指定人员当天的待审 ID。"""
 
         pending_values = {"", "0", "待审", "待审核", "pending"}
         ids: list[str] = []
-        for child in self._children_for_person(self._list_status(date, "0"), person):
+        records = self._list_status(date, "0", user_id)
+        for child in self._children_for_person(records, person, user_id):
             state = str(child.get("status", "")).strip().lower()
             if state not in pending_values:
                 continue
@@ -298,13 +365,15 @@ class SRDPMClient:
             raise APIError("审批 ID 集合为空")
         self._post("approval", {"approve_id": ",".join(ids)})
 
-    def get_approved_statuses(self, person: str, date: str) -> dict[str, str]:
+    def get_approved_statuses(
+        self, person: str, date: str, user_id: str | None = None
+    ) -> dict[str, str]:
         """重拉 status=2/3，并返回 ID 到真实状态的映射。"""
 
         result: dict[str, str] = {}
         for status_filter in ("2", "3"):
-            records = self._list_status(date, status_filter)
-            for child in self._children_for_person(records, person):
+            records = self._list_status(date, status_filter, user_id)
+            for child in self._children_for_person(records, person, user_id):
                 approve_id = _normalize_approve_id(child.get("approve_id"))
                 if approve_id is None:
                     continue

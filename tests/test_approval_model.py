@@ -27,6 +27,26 @@ def child(approve_id, status="待审", project="P1", title="开发"):
 
 
 class ApprovalModelTests(unittest.TestCase):
+    def test_parent_row_id_is_not_treated_as_stable_user_id(self):
+        raw = {
+            "daily_data": {
+                "2026-07-08": {
+                    "list": [
+                        {
+                            "id": "daily-approval-parent-id",
+                            "cn_name": "测试人员",
+                            "children": [child("10")],
+                        }
+                    ]
+                }
+            }
+        }
+
+        groups = build_approval_groups(raw)
+        group = next(iter(groups.values()))
+
+        self.assertIsNone(group["user_id"])
+
     def test_duplicate_status_results_are_collapsed_by_approve_id(self):
         raw = {
             "daily_data": {

@@ -73,7 +73,10 @@ def iter_unique_children(raw_data: Mapping[str, Any] | None) -> list[dict[str, A
     for date, day_info in daily_data.items():
         for parent in day_info.get("list", []):
             person = str(parent.get("cn_name") or "").strip()
-            user_id = parent.get("uid") or parent.get("user_id") or parent.get("id")
+            # `id` 是人员当天审批父记录的 ID，真实归档中每天都会变化，不能
+            # 当作人员身份传给实时 API。只有明确的 uid/user_id 才可用于严格匹配；
+            # 缺失时由执行器按人员姓名做兼容查询并以待审 ID 全等校验兜底。
+            user_id = parent.get("uid") or parent.get("user_id")
             for child in parent.get("children", []):
                 approve_id = str(child.get("approve_id") or "").strip()
                 identity = ("approve_id", approve_id) if approve_id else _fallback_child_key(

@@ -12,13 +12,27 @@ from unittest.mock import patch
 import requests
 
 from apply_approval_plan import (
+    OUTCOME_PARTIAL_SUCCESS,
+    OUTCOME_REJECTED_NO_CHANGE,
+    OUTCOME_STATE_UNKNOWN,
+    OUTCOME_SUCCEEDED,
+    VERIFICATION_NOT_ATTEMPTED,
+    VERIFICATION_UNKNOWN,
+    VERIFICATION_VERIFIED_APPROVED,
+    canonical_plan_payload,
     confirmation_phrase,
     execute_plan,
     load_plan,
     run_cli,
     summarize_plan,
 )
-from srdpm_client import ConfigurationError, SRDPMClient
+from srdpm_client import (
+    APIError,
+    ConfigurationError,
+    SRDPMClient,
+    _is_target_cookie_domain,
+    _is_target_url,
+)
 
 
 class NonTTYInput(io.StringIO):
@@ -26,22 +40,37 @@ class NonTTYInput(io.StringIO):
         return False
 
 
+class FakeExecutionLock:
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
 class FakeClient:
     def __init__(
         self,
         *,
-        pending: dict[tuple[str, str], list[str]] | None = None,
-        approved: dict[tuple[str, str], dict[str, str]] | None = None,
+        pending: dict[tuple[object, ...], list[str]] | None = None,
+        pending_sequences: dict[
+            tuple[object, ...], list[list[str]]
+        ] | None = None,
+        approved: dict[tuple[object, ...], dict[str, str]] | None = None,
         check_live_result: bool = True,
         approve_error: Exception | None = None,
+        readback_error: Exception | None = None,
     ) -> None:
         self.pending = pending or {}
+        self.pending_sequences = pending_sequences or {}
         self.approved = approved or {}
         self.check_live_result = check_live_result
         self.approve_error = approve_error
-        self.pending_calls: list[tuple[str, str]] = []
-        self.status_calls: list[tuple[str, str]] = []
+        self.readback_error = readback_error
+        self.pending_calls: list[tuple[str, str, str | None]] = []
+        self.status_calls: list[tuple[str, str, str | None]] = []
         self.approve_calls: list[tuple[str, ...]] = []
+        self._sequence_positions: dict[tuple[object, ...], int] = {}
         self.check_live_calls = 0
         self.closed = False
 
@@ -49,18 +78,46 @@ class FakeClient:
         self.check_live_calls += 1
         return self.check_live_result
 
-    def get_pending_ids(self, person: str, date: str) -> list[str]:
-        self.pending_calls.append((person, date))
-        return list(self.pending.get((person, date), []))
+    @staticmethod
+    def _lookup_key(
+        values: dict[tuple[object, ...], object],
+        person: str,
+        date: str,
+        user_id: str | None,
+    ) -> tuple[object, ...]:
+        exact_key = (person, date, user_id)
+        if exact_key in values:
+            return exact_key
+        return (person, date)
+
+    def get_pending_ids(
+        self, person: str, date: str, user_id: str | None = None
+    ) -> list[str]:
+        self.pending_calls.append((person, date, user_id))
+        sequence_key = self._lookup_key(
+            self.pending_sequences, person, date, user_id
+        )
+        sequence = self.pending_sequences.get(sequence_key)
+        if sequence:
+            position = self._sequence_positions.get(sequence_key, 0)
+            self._sequence_positions[sequence_key] = position + 1
+            return list(sequence[min(position, len(sequence) - 1)])
+        pending_key = self._lookup_key(self.pending, person, date, user_id)
+        return list(self.pending.get(pending_key, []))
 
     def approve_ids(self, approve_ids: list[str] | tuple[str, ...]) -> None:
         self.approve_calls.append(tuple(approve_ids))
         if self.approve_error is not None:
             raise self.approve_error
 
-    def get_approved_statuses(self, person: str, date: str) -> dict[str, str]:
-        self.status_calls.append((person, date))
-        return dict(self.approved.get((person, date), {}))
+    def get_approved_statuses(
+        self, person: str, date: str, user_id: str | None = None
+    ) -> dict[str, str]:
+        self.status_calls.append((person, date, user_id))
+        if self.readback_error is not None:
+            raise self.readback_error
+        approved_key = self._lookup_key(self.approved, person, date, user_id)
+        return dict(self.approved.get(approved_key, {}))
 
     def close(self) -> None:
         self.closed = True
@@ -68,6 +125,17 @@ class FakeClient:
 
 class NetworkBlockedTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        self.execution_locks: list[FakeExecutionLock] = []
+
+        def acquire_execution_lock() -> FakeExecutionLock:
+            execution_lock = FakeExecutionLock()
+            self.execution_locks.append(execution_lock)
+            return execution_lock
+
+        self.execution_lock_patcher = patch(
+            "apply_approval_plan._try_acquire_execution_lock",
+            side_effect=acquire_execution_lock,
+        )
         self.socket_patcher = patch(
             "socket.create_connection",
             side_effect=AssertionError("unit tests must not access network"),
@@ -77,8 +145,10 @@ class NetworkBlockedTestCase(unittest.TestCase):
             "request",
             side_effect=AssertionError("unit tests must not make HTTP requests"),
         )
+        self.execution_lock_patcher.start()
         self.socket_patcher.start()
         self.request_patcher.start()
+        self.addCleanup(self.execution_lock_patcher.stop)
         self.addCleanup(self.socket_patcher.stop)
         self.addCleanup(self.request_patcher.stop)
 
@@ -149,6 +219,109 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
             self.assertEqual(("1001", "1002"), plan.groups[0].approve_ids)
             self.assertEqual(2, summary.id_count)
 
+    def test_optional_user_id_is_normalized_and_bound_into_plan_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_plan = load_plan(self.write_plan(directory))
+            legacy_hash = summarize_plan(legacy_plan).sha256
+
+            plan = load_plan(
+                self.write_plan(
+                    directory,
+                    [
+                        {
+                            "person": "测试人员A",
+                            "user_id": "  uid-a  ",
+                            "date": "2026-07-08",
+                            "approve_ids": ["1001", "1002"],
+                        }
+                    ],
+                )
+            )
+
+            self.assertIsNone(legacy_plan.groups[0].user_id)
+            self.assertNotIn(
+                "user_id", canonical_plan_payload(legacy_plan)["groups"][0]
+            )
+            self.assertEqual("uid-a", plan.groups[0].user_id)
+            self.assertEqual(
+                "uid-a", canonical_plan_payload(plan)["groups"][0]["user_id"]
+            )
+            self.assertNotEqual(legacy_hash, summarize_plan(plan).sha256)
+
+    def test_user_id_is_forwarded_to_every_live_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(
+                self.write_plan(
+                    directory,
+                    [
+                        {
+                            "person": "测试人员A",
+                            "user_id": "uid-a",
+                            "date": "2026-07-08",
+                            "approve_ids": ["1001"],
+                        }
+                    ],
+                )
+            )
+            identity = ("测试人员A", "2026-07-08", "uid-a")
+            fake = FakeClient(
+                pending={identity: ["1001"]},
+                approved={identity: {"1001": "通过"}},
+            )
+
+            report = execute_plan(plan, fake)
+
+            self.assertTrue(report.success)
+            self.assertEqual([identity, identity], fake.pending_calls)
+            self.assertEqual([identity], fake.status_calls)
+
+    def test_busy_execution_lock_rejects_before_any_client_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            fake = FakeClient(
+                pending={("测试人员A", "2026-07-08"): ["1001", "1002"]},
+                approved={
+                    ("测试人员A", "2026-07-08"): {
+                        "1001": "通过",
+                        "1002": "通过",
+                    }
+                },
+            )
+
+            with patch(
+                "apply_approval_plan._try_acquire_execution_lock",
+                return_value=None,
+            ):
+                report = execute_plan(plan, fake)
+
+            self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_REJECTED_NO_CHANGE, report.outcome)
+            self.assertEqual((), report.group_results)
+            self.assertIn("其他审批执行进程正在运行", report.message)
+            self.assertIn("未联网、未提交审批", report.message)
+            self.assertEqual([], fake.pending_calls)
+            self.assertEqual([], fake.status_calls)
+            self.assertEqual([], fake.approve_calls)
+
+    def test_execution_lock_error_rejects_before_any_client_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            fake = FakeClient()
+
+            with patch(
+                "apply_approval_plan._try_acquire_execution_lock",
+                side_effect=RuntimeError("offline lock failure"),
+            ):
+                report = execute_plan(plan, fake)
+
+            self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_REJECTED_NO_CHANGE, report.outcome)
+            self.assertEqual((), report.group_results)
+            self.assertIn("审批执行锁不可用（RuntimeError）", report.message)
+            self.assertEqual([], fake.pending_calls)
+            self.assertEqual([], fake.status_calls)
+            self.assertEqual([], fake.approve_calls)
+
     def test_drift_rejects_before_any_approval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             plan = load_plan(self.write_plan(directory))
@@ -159,8 +332,17 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
             report = execute_plan(plan, fake)
 
             self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_REJECTED_NO_CHANGE, report.outcome)
             self.assertEqual([], fake.approve_calls)
             self.assertIn("实时待审 ID 与计划不一致", report.message)
+            self.assertEqual("precheck", report.group_results[0].phase)
+            self.assertFalse(report.group_results[0].submission_attempted)
+            self.assertFalse(report.group_results[0].mutation_possible)
+            self.assertEqual(
+                VERIFICATION_NOT_ATTEMPTED,
+                report.group_results[0].verification_status,
+            )
+            self.assertTrue(self.execution_locks[-1].released)
 
     def test_success_requires_second_pending_check_and_approved_readback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -174,9 +356,21 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
             report = execute_plan(plan, fake)
 
             self.assertTrue(report.success)
+            self.assertEqual(OUTCOME_SUCCEEDED, report.outcome)
             self.assertEqual([("1001", "1002")], fake.approve_calls)
-            self.assertEqual([group_key, group_key], fake.pending_calls)
-            self.assertEqual([group_key], fake.status_calls)
+            expected_identity = ("测试人员A", "2026-07-08", None)
+            self.assertEqual(
+                [expected_identity, expected_identity], fake.pending_calls
+            )
+            self.assertEqual([expected_identity], fake.status_calls)
+            self.assertEqual("readback", report.group_results[0].phase)
+            self.assertTrue(report.group_results[0].submission_attempted)
+            self.assertTrue(report.group_results[0].mutation_possible)
+            self.assertEqual(
+                VERIFICATION_VERIFIED_APPROVED,
+                report.group_results[0].verification_status,
+            )
+            self.assertTrue(self.execution_locks[-1].released)
 
     def test_failed_readback_returns_failure_and_stops(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -190,8 +384,159 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
             report = execute_plan(plan, fake)
 
             self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_STATE_UNKNOWN, report.outcome)
             self.assertEqual([("1001", "1002")], fake.approve_calls)
             self.assertIn("回读未全部通过", report.message)
+            self.assertEqual("readback", report.group_results[0].phase)
+            self.assertTrue(report.group_results[0].submission_attempted)
+            self.assertTrue(report.group_results[0].mutation_possible)
+            self.assertEqual(
+                VERIFICATION_UNKNOWN,
+                report.group_results[0].verification_status,
+            )
+
+    def test_submit_exception_is_not_retried_and_verified_readback_can_succeed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            group_key = ("测试人员A", "2026-07-08")
+            fake = FakeClient(
+                pending={group_key: ["1001", "1002"]},
+                approved={group_key: {"1001": "通过", "1002": "通过"}},
+                approve_error=TimeoutError("response lost after submit"),
+            )
+
+            report = execute_plan(plan, fake)
+
+            self.assertTrue(report.success)
+            self.assertEqual(OUTCOME_SUCCEEDED, report.outcome)
+            self.assertEqual([("1001", "1002")], fake.approve_calls)
+            self.assertEqual(1, len(fake.status_calls))
+            result = report.group_results[0]
+            self.assertTrue(result.success)
+            self.assertEqual("readback", result.phase)
+            self.assertTrue(result.submission_attempted)
+            self.assertTrue(result.mutation_possible)
+            self.assertEqual(
+                VERIFICATION_VERIFIED_APPROVED, result.verification_status
+            )
+
+    def test_submit_exception_with_unverified_ids_returns_state_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            group_key = ("测试人员A", "2026-07-08")
+            fake = FakeClient(
+                pending={group_key: ["1001", "1002"]},
+                approved={group_key: {"1001": "通过"}},
+                approve_error=TimeoutError("response lost after submit"),
+            )
+
+            report = execute_plan(plan, fake)
+
+            self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_STATE_UNKNOWN, report.outcome)
+            self.assertEqual([("1001", "1002")], fake.approve_calls)
+            self.assertEqual(1, len(fake.status_calls))
+            result = report.group_results[0]
+            self.assertEqual("submit", result.phase)
+            self.assertTrue(result.submission_attempted)
+            self.assertTrue(result.mutation_possible)
+            self.assertEqual(VERIFICATION_UNKNOWN, result.verification_status)
+
+    def test_verified_first_group_then_pre_submit_drift_is_partial_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(
+                self.write_plan(
+                    directory,
+                    [
+                        {
+                            "person": "测试人员A",
+                            "date": "2026-07-08",
+                            "approve_ids": ["1001"],
+                        },
+                        {
+                            "person": "测试人员B",
+                            "date": "2026-07-09",
+                            "approve_ids": ["2001"],
+                        },
+                    ],
+                )
+            )
+            first_key = ("测试人员A", "2026-07-08")
+            second_key = ("测试人员B", "2026-07-09")
+            fake = FakeClient(
+                pending_sequences={
+                    first_key: [["1001"]],
+                    second_key: [["2001"], ["9999"]],
+                },
+                approved={first_key: {"1001": "通过"}},
+            )
+
+            report = execute_plan(plan, fake)
+
+            self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_PARTIAL_SUCCESS, report.outcome)
+            self.assertEqual([("1001",)], fake.approve_calls)
+            self.assertEqual(2, len(report.group_results))
+            self.assertEqual(
+                VERIFICATION_VERIFIED_APPROVED,
+                report.group_results[0].verification_status,
+            )
+            self.assertEqual("pre_submit", report.group_results[1].phase)
+            self.assertFalse(report.group_results[1].submission_attempted)
+            self.assertFalse(report.group_results[1].mutation_possible)
+            self.assertEqual(
+                VERIFICATION_NOT_ATTEMPTED,
+                report.group_results[1].verification_status,
+            )
+
+    def test_verified_first_group_takes_partial_precedence_over_later_unknown(self) -> None:
+        class SecondGroupSubmitErrorClient(FakeClient):
+            def approve_ids(
+                self, approve_ids: list[str] | tuple[str, ...]
+            ) -> None:
+                ids = tuple(approve_ids)
+                self.approve_calls.append(ids)
+                if ids == ("2001",):
+                    raise TimeoutError("response lost after submit")
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(
+                self.write_plan(
+                    directory,
+                    [
+                        {
+                            "person": "测试人员A",
+                            "date": "2026-07-08",
+                            "approve_ids": ["1001"],
+                        },
+                        {
+                            "person": "测试人员B",
+                            "date": "2026-07-09",
+                            "approve_ids": ["2001"],
+                        },
+                    ],
+                )
+            )
+            first_key = ("测试人员A", "2026-07-08")
+            second_key = ("测试人员B", "2026-07-09")
+            fake = SecondGroupSubmitErrorClient(
+                pending={first_key: ["1001"], second_key: ["2001"]},
+                approved={first_key: {"1001": "通过"}, second_key: {}},
+            )
+
+            report = execute_plan(plan, fake)
+
+            self.assertFalse(report.success)
+            self.assertEqual(OUTCOME_PARTIAL_SUCCESS, report.outcome)
+            self.assertEqual([("1001",), ("2001",)], fake.approve_calls)
+            self.assertEqual(
+                VERIFICATION_VERIFIED_APPROVED,
+                report.group_results[0].verification_status,
+            )
+            self.assertEqual(
+                VERIFICATION_UNKNOWN,
+                report.group_results[1].verification_status,
+            )
 
     def test_non_tty_execute_without_explicit_confirmation_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -299,6 +644,79 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
 
 
 class ClientConfigurationTests(NetworkBlockedTestCase):
+    def test_target_url_and_cookie_checks_reject_lookalike_hosts(self) -> None:
+        self.assertTrue(
+            _is_target_url(
+                "https://rd-mokadisplay.tcl.com/srdpm/#/work-list",
+                "/srdpm/",
+            )
+        )
+        self.assertTrue(
+            _is_target_url(
+                "https://rd-mokadisplay.tcl.com/srdpm-api/workload/approve/list",
+                "/srdpm-api/",
+            )
+        )
+        self.assertFalse(
+            _is_target_url(
+                "https://evil.example/srdpm-api/workload/approve/list",
+                "/srdpm-api/",
+            )
+        )
+        self.assertFalse(
+            _is_target_url(
+                "https://rd-mokadisplay.tcl.com.evil.example/srdpm/",
+                "/srdpm/",
+            )
+        )
+        self.assertFalse(
+            _is_target_url(
+                "https://rd-mokadisplay.tcl.com@evil.example/srdpm/",
+                "/srdpm/",
+            )
+        )
+        self.assertTrue(_is_target_cookie_domain(".rd-mokadisplay.tcl.com"))
+        self.assertFalse(_is_target_cookie_domain("evil.rd-mokadisplay.tcl.com"))
+
+    def test_user_id_matching_is_strict_and_name_is_only_legacy_fallback(self) -> None:
+        records = [
+            {
+                "cn_name": "同名人员",
+                "uid": "uid-a",
+                "children": [{"approve_id": "1001"}],
+            },
+            {
+                "cn_name": "同名人员",
+                "user_id": "uid-b",
+                "children": [{"approve_id": "2001"}],
+            },
+        ]
+
+        strict = list(
+            SRDPMClient._children_for_person(records, "过期姓名", "uid-b")
+        )
+        legacy = list(SRDPMClient._children_for_person(records, "同名人员"))
+
+        self.assertEqual(["2001"], [item["approve_id"] for item in strict])
+        self.assertEqual(
+            ["1001", "2001"], [item["approve_id"] for item in legacy]
+        )
+
+        conflicting = [
+            {
+                "cn_name": "同名人员",
+                "uid": "uid-a",
+                "user_id": "uid-b",
+                "children": [],
+            }
+        ]
+        with self.assertRaises(APIError):
+            list(
+                SRDPMClient._children_for_person(
+                    conflicting, "同名人员", "uid-a"
+                )
+            )
+
     def test_credentials_are_read_only_from_environment_and_repr_is_masked(self) -> None:
         with patch.dict(
             os.environ,
