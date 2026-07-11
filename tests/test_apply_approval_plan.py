@@ -753,6 +753,16 @@ class ClientConfigurationTests(NetworkBlockedTestCase):
             with self.assertRaises(ConfigurationError):
                 SRDPMClient.from_env()
 
+    def test_client_can_be_created_from_in_memory_credentials_without_repr_leak(self) -> None:
+        client = SRDPMClient.from_credentials(" offline-user ", "offline-secret")
+
+        self.assertNotIn("offline-secret", repr(client))
+        self.assertNotIn("offline-user", repr(client))
+        with self.assertRaises(ConfigurationError):
+            SRDPMClient.from_credentials("", "offline-secret")
+        with self.assertRaises(ConfigurationError):
+            SRDPMClient.from_credentials("offline-user", "bad\nsecret")
+
 
 if __name__ == "__main__":
     unittest.main()

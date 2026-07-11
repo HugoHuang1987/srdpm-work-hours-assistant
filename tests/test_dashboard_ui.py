@@ -1,6 +1,7 @@
 import json
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import build_multi_month_dashboard as dashboard
 from apply_approval_plan import load_plan, summarize_plan
@@ -42,9 +43,23 @@ class DashboardUiTests(unittest.TestCase):
     def assert_no_page_errors(self):
         self.assertEqual(self.page_errors, [])
 
-    def open_mock_local_service(self, job_factory):
+    def open_mock_local_service(
+        self,
+        job_factory,
+        *,
+        credential_configured=True,
+        initial_fragment="",
+        initial_groups=None,
+    ):
         requests = []
-        expected = {"id_counts": {}, "groups": {}}
+        expected = {
+            "id_counts": {},
+            "groups": {},
+            "credential_configured": credential_configured,
+        }
+        for group in initial_groups or []:
+            expected["id_counts"][group["group_key"]] = group["id_count"]
+            expected["groups"][group["group_key"]] = group
         dashboard_html = Path(dashboard.OUTPUT_HTML).read_text(encoding="utf-8")
         config = {
             "api_base": "/api/v1",
@@ -74,6 +89,39 @@ class DashboardUiTests(unittest.TestCase):
                     "csrf": request.headers.get("x-srdpm-csrf"),
                 }
             )
+            if path == "/api/v1/credentials/status":
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "ok": True,
+                            "credentials": {
+                                "configured": expected["credential_configured"],
+                                "source": "windows_credential_manager"
+                                if expected["credential_configured"]
+                                else None,
+                            },
+                        }
+                    ),
+                )
+                return
+            if path == "/api/v1/credentials/configure":
+                expected["credential_configured"] = True
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "ok": True,
+                            "credentials": {
+                                "configured": True,
+                                "source": "windows_credential_manager",
+                            },
+                        }
+                    ),
+                )
+                return
             if path == "/api/v1/approval/prepare":
                 body = request.post_data_json
                 keys = body["group_keys"]
@@ -124,7 +172,10 @@ class DashboardUiTests(unittest.TestCase):
             route.fulfill(status=404, content_type="application/json", body='{"ok":false}')
 
         self.context.route("http://127.0.0.1:8765/**", route_local_service)
-        self.page.goto("http://127.0.0.1:8765/", wait_until="domcontentloaded")
+        self.page.goto(
+            f"http://127.0.0.1:8765/{initial_fragment}",
+            wait_until="domcontentloaded",
+        )
         self.page.wait_for_selector("#pendingCount")
         self.assertEqual(
             self.page.locator("#approvalServiceStatus").inner_text(),
@@ -206,20 +257,174 @@ class DashboardUiTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assert_no_page_errors()
 
-    def test_static_file_requires_launcher_for_direct_approval(self):
+    def test_static_file_builds_minimal_local_service_handoff(self):
         self.page.locator('.cat-nav-item[data-cat="three"]').click()
         self.page.locator("#panel_three tbody .btn-approve").first.click()
-        self.page.once("dialog", lambda dialog: dialog.accept())
-        self.page.locator("#btnExecute").click()
-
-        self.assertIn(
-            "启动工时审批看板.cmd",
-            self.page.locator("#approvalFeedback").inner_text(),
+        transfer_url = self.page.evaluate(
+            "buildLocalServiceTransferUrl(buildSelectedApprovalPlan())"
         )
+        parsed = urlparse(transfer_url)
+        payload = json.loads(parse_qs(parsed.fragment)["approval_selection"][0])
+
+        self.assertEqual(f"{parsed.scheme}://{parsed.netloc}", "http://127.0.0.1:8765")
+        self.assertEqual(set(payload), {"version", "month", "group_keys"})
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["month"], "2026-07")
+        self.assertEqual(len(payload["group_keys"]), 1)
+        self.assertNotIn("approve_ids", json.dumps(payload))
+        self.assertNotIn("person", json.dumps(payload))
+        self.assertNotIn("user_id", json.dumps(payload))
         self.assertEqual(
             self.page.locator("#approvalServiceStatus").inner_text(),
-            "直接审批：请从“启动工时审批看板.cmd”打开",
+            "直接审批：点击按钮将自动连接后台服务",
         )
+        self.assert_no_page_errors()
+
+    def test_local_service_consumes_handoff_once_and_replaces_stale_selection(self):
+        groups = self.page.evaluate(
+            "Object.values(APPROVAL_GROUPS).filter(group => group.review_mode === 'manual').slice(0, 2)"
+        )
+        selected, stale = groups
+        transfer_url = self.page.evaluate(
+            """key => {
+                approvalState = {[key]: 'selected'};
+                return buildLocalServiceTransferUrl(buildSelectedApprovalPlan());
+            }""",
+            selected["group_key"],
+        )
+        row = {
+            "group_key": selected["group_key"],
+            "date": selected["date"],
+            "person": selected["person"],
+            "id_count": len(selected["approve_ids"]),
+            "item_count": selected["item_count"],
+            "work_hours": 8,
+            "projects": ["P/HANDOFF"],
+            "project_count": 1,
+            "review_summary": "三、工时异常",
+            "review_mode": selected["review_mode"],
+        }
+        stale_json = json.dumps({stale["group_key"]: "selected"})
+        self.context.add_init_script(
+            script=f"""if (location.hostname === '127.0.0.1') {{
+                localStorage.setItem('srdpm_approval_v2_2026-07', {json.dumps(stale_json)});
+            }}"""
+        )
+
+        requests, _ = self.open_mock_local_service(
+            lambda: {},
+            initial_fragment="#" + urlparse(transfer_url).fragment,
+            initial_groups=[row],
+        )
+        self.page.wait_for_selector("#approvalConfirmOverlay.show")
+
+        self.assertEqual(urlparse(self.page.url).fragment, "")
+        state = json.loads(
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+        )
+        self.assertEqual(state, {selected["group_key"]: "selected"})
+        prepare = next(item for item in requests if item["path"] == "/api/v1/approval/prepare")
+        self.assertEqual(
+            prepare["body"],
+            {"month": "2026-07", "group_keys": [selected["group_key"]]},
+        )
+        self.assertFalse(any(item["path"] == "/api/v1/approval/execute" for item in requests))
+        self.assertIn("P/HANDOFF", self.page.locator("#approvalConfirmOverlay").inner_text())
+        self.page.locator("#approvalConfirmCancel").click()
+        self.assert_no_page_errors()
+
+    def test_first_ui_credential_setup_precedes_prepare_and_clears_password(self):
+        requests, expected = self.open_mock_local_service(
+            lambda: {}, credential_configured=False
+        )
+        selected = self.page.evaluate(
+            """() => {
+                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                approvalState[group.group_key] = 'selected';
+                saveState();
+                updatePendingCount();
+                return group;
+            }"""
+        )
+        row = {
+            "group_key": selected["group_key"],
+            "date": selected["date"],
+            "person": selected["person"],
+            "id_count": len(selected["approve_ids"]),
+            "item_count": selected["item_count"],
+            "work_hours": 8,
+            "projects": ["P/CREDENTIAL"],
+            "review_summary": "三、工时异常",
+            "review_mode": selected["review_mode"],
+        }
+        expected["id_counts"][selected["group_key"]] = len(selected["approve_ids"])
+        expected["groups"][selected["group_key"]] = row
+
+        self.page.locator("#btnExecute").click()
+        self.page.wait_for_selector("#credentialSetupOverlay.show")
+        self.assertFalse(any(item["path"] == "/api/v1/approval/prepare" for item in requests))
+        username = "ui-offline-user"
+        password = "ui-offline-secret"
+        self.page.locator("#credentialUsername").fill(username)
+        self.page.locator("#credentialPassword").fill(password)
+        self.page.locator("#credentialSetupSave").click()
+        self.page.wait_for_selector("#approvalConfirmOverlay.show")
+
+        configured = next(
+            item for item in requests if item["path"] == "/api/v1/credentials/configure"
+        )
+        self.assertEqual(
+            configured["body"], {"username": username, "password": password}
+        )
+        self.assertEqual(self.page.locator("#credentialPassword").input_value(), "")
+        self.assertNotIn(password, self.page.content())
+        self.assertNotIn(password, self.page.evaluate("JSON.stringify(localStorage)"))
+        self.assertTrue(any(item["path"] == "/api/v1/approval/prepare" for item in requests))
+        self.assertFalse(any(item["path"] == "/api/v1/approval/execute" for item in requests))
+        self.page.locator("#approvalConfirmCancel").click()
+        self.assert_no_page_errors()
+
+    def test_invalid_handoff_is_cleared_without_any_api_action(self):
+        fragment = "#" + urlencode(
+            {
+                "approval_selection": json.dumps(
+                    {
+                        "version": 1,
+                        "month": "2026-07",
+                        "group_keys": ["grp_ffffffffffffffffffff"],
+                    }
+                )
+            }
+        )
+        requests, _ = self.open_mock_local_service(
+            lambda: {}, initial_fragment=fragment
+        )
+
+        self.assertEqual(urlparse(self.page.url).fragment, "")
+        self.assertIn("无法导入所选整单", self.page.locator("#approvalFeedback").inner_text())
+        self.assertEqual(requests, [])
+        self.assert_no_page_errors()
+
+    def test_cancelling_ui_credential_setup_never_prepares_or_executes(self):
+        requests, _ = self.open_mock_local_service(
+            lambda: {}, credential_configured=False
+        )
+        self.page.evaluate(
+            """() => {
+                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                approvalState[group.group_key] = 'selected';
+                saveState();
+                updatePendingCount();
+            }"""
+        )
+        self.page.locator("#btnExecute").click()
+        self.page.wait_for_selector("#credentialSetupOverlay.show")
+        self.page.locator("#credentialPassword").fill("cancelled-secret")
+        self.page.locator("#credentialSetupCancel").click()
+
+        self.assertFalse(any("/approval/" in item["path"] for item in requests))
+        self.assertEqual(self.page.locator("#credentialPassword").input_value(), "")
+        self.assertNotIn("cancelled-secret", self.page.content())
         self.assert_no_page_errors()
 
     def test_platform_selected_rows_can_be_cancelled_in_platform_view(self):

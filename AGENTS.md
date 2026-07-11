@@ -23,7 +23,7 @@
 
 ## 凭据与数据安全
 
-- SRDPM 登录凭据只能从环境变量 `SRDPM_USERNAME` 和 `SRDPM_PASSWORD` 读取。
+- 命令行执行器只从环境变量 `SRDPM_USERNAME` 和 `SRDPM_PASSWORD` 读取凭据；后台 UI 服务允许使用当前 Windows 用户的 Credential Manager 固定 Generic Credential `SRDPM.WorkHoursAssistant`。禁止任何明文文件持久化。
 - 禁止在源码、Markdown、JSON、日志、测试夹具、生成 HTML或聊天中写入、输出或复制真实密码、Cookie、token、PAT、Authorization header 或其他凭据。
 - 禁止读取或提交旧凭据 JSON。发现历史凭据时只报告文件路径和风险，不显示值，并建议轮换。
 - `raw_data`、`srdpm_archive/`、员工工时内容、审核报告、截图、抓包页面、凭据 JSON 和审批日志只能保存在本机，不得提交版本库。
@@ -41,7 +41,9 @@
   5. 提交后立即从 SRDPM 回读真实状态，只有回读通过才显示“已审批”。
 - 未得到用户针对当次具体清单的明确确认，不得调用任何真实审批或驳回接口。
 - 页面直批请求只能发送 `month + group_keys`；人员、日期、`user_id` 和审批 ID 必须由服务端从当前归档重建。服务必须保持精确 Host/Origin、同源 Fetch Metadata、随机 CSRF、一次性短期 ticket、单任务执行锁和后台任务轮询，禁止 CORS 与自动重试审批提交。
+- `file://` 页面只能通过顶层导航把 `month + group_keys` 放入 localhost URL fragment；后台服务消费后必须立即清除 fragment，并以转交选择完整替换 localhost 旧选择。凭据不得进入 URL、storage、HTML、日志或反馈。
 - 提交调用抛异常时必须先只读回查，不能自动重提；只有逐 ID 回读为“通过”才能标记成功，其余必须区分 `not_attempted` 与 `unknown`。
+- 后台常驻服务的 execute 不能只信任浏览器确认；服务端必须在创建任务前显示 Windows 原生安全确认，默认选择“否”，并同时展示与网页清单一致的摘要哈希前缀。取消、弹窗不可用或摘要漂移都必须在创建客户端前停止。
 
 ## 统计与状态语义
 

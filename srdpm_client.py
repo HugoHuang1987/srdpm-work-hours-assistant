@@ -121,10 +121,20 @@ class SRDPMClient:
     def from_env(cls) -> "SRDPMClient":
         username = os.environ.get("SRDPM_USERNAME", "").strip()
         password = os.environ.get("SRDPM_PASSWORD", "")
+        return cls.from_credentials(username, password)
+
+    @classmethod
+    def from_credentials(cls, username: str, password: str) -> "SRDPMClient":
+        """从受信任的进程内凭据创建客户端，不记录或输出真实值。"""
+
+        username = str(username or "").strip()
+        password = str(password or "")
         if not username or not password:
-            raise ConfigurationError(
-                "缺少 SRDPM_USERNAME 或 SRDPM_PASSWORD 环境变量"
-            )
+            raise ConfigurationError("缺少 SRDPM 用户名或密码")
+        if len(username) > 256 or any(ord(ch) < 32 for ch in username):
+            raise ConfigurationError("SRDPM 用户名格式不合法")
+        if len(password) > 4096 or any(ch in "\r\n\x00" for ch in password):
+            raise ConfigurationError("SRDPM 密码格式不合法")
         return cls(
             _username=username,
             _password=password,

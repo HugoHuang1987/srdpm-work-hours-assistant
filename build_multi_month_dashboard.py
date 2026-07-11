@@ -602,6 +602,12 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f
 .approval-modal-actions button { padding: 9px 20px; border-radius: 6px; border: 0; cursor: pointer; font-size: 14px; }
 .approval-modal-cancel { background: #eee; color: #333; }
 .approval-modal-accept { background: #c62828; color: #fff; font-weight: 700; }
+.credential-modal { width: min(500px, 94vw); }
+.credential-fields { display: grid; gap: 12px; padding: 18px 22px; }
+.credential-fields label { display: grid; gap: 5px; color: #444; font-size: 13px; font-weight: 600; }
+.credential-fields input { width: 100%; padding: 9px 11px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+.credential-note { color: #666; font-size: 12px; line-height: 1.7; }
+.credential-error { min-height: 20px; color: #b71c1c; font-size: 12px; }
 body.approval-busy .month-btn,
 body.approval-busy .cat-nav-item,
 body.approval-busy .btn-approve,
@@ -732,10 +738,33 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
                 <tbody id="approvalConfirmRows"></tbody>
             </table>
         </div>
-        <div class="approval-modal-warning">⚠️ SRDPM 审批不可撤回。请逐行核对后再确认；这次确认会立即启动真实审批。</div>
+        <div class="approval-modal-warning">⚠️ SRDPM 审批不可撤回。请逐行核对后继续，并在随后出现的 Windows 安全确认中核对相同清单校验码；只有两处都确认才会启动真实审批。</div>
         <div class="approval-modal-actions">
             <button id="approvalConfirmCancel" class="approval-modal-cancel" type="button">取消，保留选择</button>
             <button id="approvalConfirmAccept" class="approval-modal-accept" type="button">确认并执行真实审批</button>
+        </div>
+    </div>
+</div>
+
+<div id="credentialSetupOverlay" class="approval-modal-backdrop" aria-hidden="true">
+    <div class="approval-modal credential-modal" role="dialog" aria-modal="true" aria-labelledby="credentialSetupTitle">
+        <div class="approval-modal-header">
+            <h3 id="credentialSetupTitle">首次配置 SRDPM 登录信息</h3>
+            <div class="approval-modal-summary">只需在此电脑配置一次，之后可直接从页面审批。</div>
+        </div>
+        <div class="credential-fields">
+            <label>SRDPM 用户名
+                <input id="credentialUsername" type="text" maxlength="256" autocomplete="username" spellcheck="false">
+            </label>
+            <label>SRDPM 密码
+                <input id="credentialPassword" type="password" maxlength="4096" autocomplete="current-password">
+            </label>
+            <div class="credential-note">凭据仅发送给 127.0.0.1 本机服务，并保存到当前 Windows 用户的凭据管理器；不会写入 HTML、JSON、日志或代码。</div>
+            <div id="credentialSetupError" class="credential-error" role="alert"></div>
+        </div>
+        <div class="approval-modal-actions">
+            <button id="credentialSetupCancel" class="approval-modal-cancel" type="button">取消</button>
+            <button id="credentialSetupSave" class="approval-modal-accept" type="button">安全保存并继续</button>
         </div>
     </div>
 </div>
@@ -748,11 +777,12 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
         <ol>
             <li>先逐个处理“三、工时异常”和“四、项目归属异常”；按钮选择的是<b>人员+日期整单</b>。</li>
             <li>点击工具栏“全选全部自动候选”；含异常的整单会自动跳过，各分类中的重复展示不会重复计数。</li>
-            <li>点击“直接审批已选整单”，核对月份和数量后确认一次；本机服务会完成校验、真实审批和结果回读。</li>
+            <li>点击“直接审批已选整单”；页面会自动连接后台本机服务。首次使用时在 UI 内配置一次登录信息。</li>
+            <li>逐行核对人员、日期、审核来源、项目、工时和影响范围后确认一次；本机服务会完成校验、真实审批和结果回读。</li>
             <li>只有 SRDPM 回读明确为“通过”的整单才会在页面标记为已审批；失败或状态未知的整单会保留选择，且不会自动重试。</li>
             <li>“导出 JSON 备用”仍可用于离线核对，导出本身<b>不会修改 SRDPM</b>。</li>
         </ol>
-        <p style="margin-top:10px;font-size:12px;color:#888;">⚠️ SRDPM审批不可撤回。请从“启动工时审批看板.cmd”打开页面；登录凭据只交给本机服务，不写入 HTML。</p>
+        <p style="margin-top:10px;font-size:12px;color:#888;">⚠️ SRDPM审批不可撤回。后台服务由 Windows 自动启动；登录凭据只保存在当前用户的 Windows 凭据管理器中。</p>
     </div>
 </div>
 
@@ -784,6 +814,7 @@ function readLocalServiceConfig() {
 }
 
 const LOCAL_SERVICE = readLocalServiceConfig();
+const LOCAL_SERVICE_ORIGIN = "http://127.0.0.1:8765";
 
 function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -880,6 +911,9 @@ function init() {
     updateLocalServiceStatus();
     renderMonthSelector();
     switchMonth(currentMonth);
+    if (importTransferredApprovalSelection()) {
+        setTimeout(() => executeSelectedApprovals(), 0);
+    }
 }
 
 function updateLocalServiceStatus() {
@@ -888,8 +922,54 @@ function updateLocalServiceStatus() {
         element.textContent = "本机审批服务：已连接";
         element.className = "service-status ready";
     } else {
-        element.textContent = "直接审批：请从“启动工时审批看板.cmd”打开";
-        element.className = "service-status offline";
+        element.textContent = "直接审批：点击按钮将自动连接后台服务";
+        element.className = "service-status ready";
+    }
+}
+
+function buildLocalServiceTransferUrl(plan) {
+    const params = new URLSearchParams();
+    params.set("approval_selection", JSON.stringify({
+        version: 1,
+        month: plan.month,
+        group_keys: plan.groups.map(group => group.group_key)
+    }));
+    return `${LOCAL_SERVICE_ORIGIN}/#${params.toString()}`;
+}
+
+function importTransferredApprovalSelection() {
+    if (!LOCAL_SERVICE || !location.hash) return false;
+    const params = new URLSearchParams(location.hash.slice(1));
+    const encoded = params.get("approval_selection");
+    if (!encoded) return false;
+    history.replaceState(null, "", `${location.pathname}${location.search}`);
+    try {
+        if (encoded.length > 16_384) throw new Error("转交的审批选择超过安全上限");
+        const payload = JSON.parse(encoded);
+        const keys = Object.keys(payload || {}).sort();
+        const groupKeys = payload?.group_keys;
+        if (keys.join(",") !== "group_keys,month,version" || payload.version !== 1 ||
+            !Object.prototype.hasOwnProperty.call(ALL_DATA, payload.month) ||
+            !Array.isArray(groupKeys) || groupKeys.length < 1 || groupKeys.length > 200 ||
+            new Set(groupKeys).size !== groupKeys.length ||
+            groupKeys.some(key => typeof key !== "string" || !/^grp_[0-9a-f]{20}$/.test(key))) {
+            throw new Error("转交的审批选择格式不合法");
+        }
+        if (payload.month !== currentMonth) switchMonth(payload.month);
+        if (groupKeys.some(groupKey => !APPROVAL_GROUPS[groupKey])) {
+            throw new Error("转交的整单已不在当前看板中");
+        }
+        approvalState = {};
+        for (const groupKey of groupKeys) {
+            if (getGroupStatus(groupKey) !== "approved") approvalState[groupKey] = "selected";
+        }
+        saveState();
+        renderCategoryNav();
+        switchTab(currentCatKey);
+        return Object.keys(approvalState).length > 0;
+    } catch (error) {
+        setApprovalFeedback("error", `无法导入所选整单：${error.message || "格式错误"}`);
+        return false;
     }
 }
 
@@ -1453,7 +1533,8 @@ function showPreparedApprovalConfirmation(prepared) {
     const autoCount = groups.length - manualCount;
     document.getElementById("approvalConfirmSummary").textContent =
         `${summary.month} · ${summary.group_count}个人日 · ${summary.id_count}个待审ID` +
-        `（人工确认${manualCount}单，自动候选${autoCount}单）`;
+        `（人工确认${manualCount}单，自动候选${autoCount}单） · ` +
+        `清单校验码 ${String(summary.sha256 || "").slice(0, 12).toUpperCase()}`;
 
     const body = document.getElementById("approvalConfirmRows");
     body.replaceChildren();
@@ -1509,6 +1590,80 @@ function showPreparedApprovalConfirmation(prepared) {
         overlay.addEventListener("click", backdropHandler);
         document.addEventListener("keydown", keyHandler);
     });
+}
+
+function showCredentialSetup() {
+    const overlay = document.getElementById("credentialSetupOverlay");
+    const usernameInput = document.getElementById("credentialUsername");
+    const passwordInput = document.getElementById("credentialPassword");
+    const errorElement = document.getElementById("credentialSetupError");
+    const saveButton = document.getElementById("credentialSetupSave");
+    const cancelButton = document.getElementById("credentialSetupCancel");
+    usernameInput.value = "";
+    passwordInput.value = "";
+    errorElement.textContent = "";
+    overlay.classList.add("show");
+    overlay.setAttribute("aria-hidden", "false");
+    usernameInput.focus();
+
+    return new Promise(resolve => {
+        const finish = result => {
+            overlay.classList.remove("show");
+            overlay.setAttribute("aria-hidden", "true");
+            saveButton.removeEventListener("click", saveHandler);
+            cancelButton.removeEventListener("click", cancelHandler);
+            overlay.removeEventListener("click", backdropHandler);
+            document.removeEventListener("keydown", keyHandler);
+            usernameInput.value = "";
+            passwordInput.value = "";
+            errorElement.textContent = "";
+            resolve(result);
+        };
+        const saveHandler = () => {
+            const username = usernameInput.value.trim();
+            const password = passwordInput.value;
+            if (!username || !password) {
+                errorElement.textContent = "用户名和密码都不能为空。";
+                return;
+            }
+            if (/\\r|\\n|\\0/.test(username) || /\\r|\\n|\\0/.test(password)) {
+                errorElement.textContent = "登录信息包含不允许的控制字符。";
+                return;
+            }
+            finish({username, password});
+        };
+        const cancelHandler = () => finish(null);
+        const backdropHandler = event => {
+            if (event.target === overlay) finish(null);
+        };
+        const keyHandler = event => {
+            if (event.key === "Escape") finish(null);
+            if (event.key === "Enter" && event.target === passwordInput) saveHandler();
+        };
+        saveButton.addEventListener("click", saveHandler);
+        cancelButton.addEventListener("click", cancelHandler);
+        overlay.addEventListener("click", backdropHandler);
+        document.addEventListener("keydown", keyHandler);
+    });
+}
+
+async function ensureCredentialsConfigured() {
+    const statusData = await requestLocalApprovalApi("/credentials/status");
+    if (statusData.credentials?.configured === true) return true;
+    const credentials = await showCredentialSetup();
+    if (!credentials) return false;
+    try {
+        const saved = await requestLocalApprovalApi("/credentials/configure", {
+            method: "POST",
+            body: {username: credentials.username, password: credentials.password}
+        });
+        if (saved.credentials?.configured !== true) {
+            throw new Error("Windows 凭据管理器未确认保存成功");
+        }
+        return true;
+    } finally {
+        credentials.password = "";
+    }
 }
 
 function setApprovalBusy(active) {
@@ -1609,9 +1764,8 @@ async function executeSelectedApprovals() {
     const plan = buildSelectedApprovalPlan();
     if (!plan) return;
     if (!LOCAL_SERVICE) {
-        const message = "直接审批必须从本目录的“启动工时审批看板.cmd”打开；当前静态页面不会发送审批请求。";
-        setApprovalFeedback("warning", message);
-        alert(message);
+        setApprovalFeedback("info", "正在自动连接后台审批服务并转交当前选择……");
+        location.assign(buildLocalServiceTransferUrl(plan));
         return;
     }
 
@@ -1620,8 +1774,13 @@ async function executeSelectedApprovals() {
     let executeRequestStarted = false;
     let jobStarted = false;
     setApprovalBusy(true);
-    setApprovalFeedback("info", "正在由本机服务从当前归档重建并校验所选整单……");
+    setApprovalFeedback("info", "正在检查本机审批服务和登录配置……");
     try {
+        if (!await ensureCredentialsConfigured()) {
+            setApprovalFeedback("info", "已取消登录配置，本次没有发送真实审批请求，原选择保留。");
+            return;
+        }
+        setApprovalFeedback("info", "正在由本机服务从当前归档重建并校验所选整单……");
         const prepareData = await requestLocalApprovalApi("/approval/prepare", {
             method: "POST",
             body: {month: executionMonth, group_keys: groupKeys}
@@ -1644,7 +1803,7 @@ async function executeSelectedApprovals() {
             return;
         }
 
-        setApprovalFeedback("info", "已确认，正在提交本机审批任务；请勿重复点击……");
+        setApprovalFeedback("info", "请在随后出现的 Windows 安全确认中核对相同清单校验码；请勿重复点击……");
         executeRequestStarted = true;
         const executeData = await requestLocalApprovalApi("/approval/execute", {
             method: "POST",

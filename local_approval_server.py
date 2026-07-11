@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import hmac
 import json
 import math
+import os
 import re
 import secrets
 import sys
@@ -52,10 +54,12 @@ from approval_model import (
 )
 from build_multi_month_dashboard import build_category_data
 from srdpm_client import SRDPMClient
+from windows_credential_store import WindowsCredentialStore
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DASHBOARD_NAME = "工时审批看板_多月.html"
+SERVICE_BUILD_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 GROUP_KEY_PATTERN = re.compile(r"^grp_[0-9a-f]{20}$")
 JOB_PATH_PATTERN = re.compile(r"^/api/v1/approval/jobs/([A-Za-z0-9_-]{20,100})$")
@@ -141,6 +145,37 @@ def _impact_summaries(raw_data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         summary["work_hours"] = round(summary["work_hours"], 2)
         summary.pop("_project_seen", None)
     return summaries
+
+
+def confirm_approval_with_windows(summary: PlanSummary) -> bool:
+    """要求当前 Windows 桌面上的用户对不可撤回提交做原生确认。"""
+
+    if os.name != "nt":
+        raise RuntimeError("Windows user-presence confirmation is unavailable")
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.MessageBoxW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+    ]
+    user32.MessageBoxW.restype = ctypes.c_int
+    verification_code = summary.sha256[:12].upper()
+    message = (
+        "即将执行不可撤回的 SRDPM 真实审批。\n\n"
+        f"月份：{summary.month}\n"
+        f"人员日期整单：{summary.group_count}\n"
+        f"待审 ID：{summary.id_count}\n"
+        f"清单校验码：{verification_code}\n\n"
+        "只有当你刚刚在 SRDPM 工时审批看板核对过相同校验码时，才点击“是”。\n"
+        "如果这个弹窗不是你主动触发的，请点击“否”。"
+    )
+    flags = 0x00000004 | 0x00000030 | 0x00000100 | 0x00010000 | 0x00040000
+    return user32.MessageBoxW(
+        None, message, "SRDPM 不可撤回审批 — Windows 安全确认", flags
+    ) == 6
 
 
 def _read_json_file(path: Path, label: str, *, required: bool) -> Any:
@@ -312,7 +347,10 @@ class ApprovalService:
         *,
         project_dir: Path = PROJECT_DIR,
         archive_root: Path | None = None,
-        client_factory: Callable[[], Any] = SRDPMClient.from_env,
+        client_factory: Callable[[], Any] | None = None,
+        credential_store: Any | None = None,
+        credential_client_factory: Callable[[str, str], Any] = SRDPMClient.from_credentials,
+        approval_confirmer: Callable[[PlanSummary], bool] = confirm_approval_with_windows,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
@@ -322,7 +360,10 @@ class ApprovalService:
             else self.project_dir / "srdpm_archive"
         )
         self.dashboard_path = self.project_dir / DASHBOARD_NAME
-        self.client_factory = client_factory
+        self.credential_store = credential_store or WindowsCredentialStore()
+        self.credential_client_factory = credential_client_factory
+        self.approval_confirmer = approval_confirmer
+        self.client_factory = client_factory or self._client_from_configured_credentials
         self.monotonic = monotonic
         self.instance_id = secrets.token_urlsafe(18)
         self.csrf_token = secrets.token_urlsafe(32)
@@ -330,6 +371,71 @@ class ApprovalService:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._state_lock = threading.RLock()
         self._execution_lock = threading.Lock()
+
+    @staticmethod
+    def _environment_credentials_configured() -> bool:
+        return bool(
+            os.environ.get("SRDPM_USERNAME", "").strip()
+            and os.environ.get("SRDPM_PASSWORD", "")
+        )
+
+    def credentials_status(self) -> dict[str, Any]:
+        try:
+            if self.credential_store.has_credentials():
+                return {"configured": True, "source": "windows_credential_manager"}
+        except Exception as exc:
+            raise ServiceError(
+                503, "credential_store_unavailable", "Windows 凭据管理器暂不可用"
+            ) from exc
+        if self._environment_credentials_configured():
+            return {"configured": True, "source": "environment"}
+        return {"configured": False, "source": None}
+
+    def configure_credentials(self, username: Any, password: Any) -> dict[str, Any]:
+        if not isinstance(username, str) or not isinstance(password, str):
+            raise ServiceError(400, "invalid_credentials", "用户名和密码格式不合法")
+        username = username.strip()
+        if (
+            not username
+            or not password
+            or len(username) > 256
+            or len(password) > 4096
+            or any(ord(ch) < 32 for ch in username)
+            or any(ch in "\r\n\x00" for ch in password)
+        ):
+            raise ServiceError(400, "invalid_credentials", "用户名和密码格式不合法")
+
+        client: Any | None = None
+        try:
+            client = self.credential_client_factory(username, password)
+            if not client.check_live():
+                raise RuntimeError("read-only login validation returned false")
+        except Exception as exc:
+            raise ServiceError(
+                401, "credential_validation_failed", "SRDPM 登录校验失败，请检查用户名和密码"
+            ) from exc
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        try:
+            self.credential_store.save(username, password)
+        except Exception as exc:
+            raise ServiceError(
+                503, "credential_store_write_failed", "登录校验已通过，但 Windows 凭据保存失败"
+            ) from exc
+        return {"configured": True, "source": "windows_credential_manager"}
+
+    def _client_from_configured_credentials(self) -> Any:
+        credentials = self.credential_store.load()
+        if credentials is not None:
+            return self.credential_client_factory(
+                credentials.username, credentials.password
+            )
+        return SRDPMClient.from_env()
 
     def rebuild(self, month: str, group_keys: Sequence[str]) -> RebuiltPlan:
         return rebuild_plan_from_archive(self.archive_root, month, group_keys)
@@ -388,13 +494,44 @@ class ApprovalService:
                 raise ServiceError(409, "execution_busy", "已有真实审批任务正在执行")
 
             ticket.used = True
+            reserved_ticket = copy.copy(ticket)
+
+        try:
+            rebuilt = self.rebuild(reserved_ticket.month, reserved_ticket.group_keys)
+            if not hmac.compare_digest(
+                rebuilt.summary.sha256, reserved_ticket.plan_sha256
+            ):
+                raise ServiceError(
+                    409,
+                    "archive_changed_before_confirmation",
+                    "归档在清单确认前发生变化，未提交审批",
+                )
+            try:
+                confirmed = self.approval_confirmer(rebuilt.summary)
+            except Exception as exc:
+                raise ServiceError(
+                    503,
+                    "native_confirmation_unavailable",
+                    "无法显示 Windows 安全确认，未提交审批",
+                ) from exc
+            if not confirmed:
+                raise ServiceError(
+                    409,
+                    "native_confirmation_rejected",
+                    "Windows 安全确认已取消，未提交审批",
+                )
+        except Exception:
+            self._execution_lock.release()
+            raise
+
+        with self._state_lock:
             job_id = secrets.token_urlsafe(24)
             job = {
                 "job_id": job_id,
                 "status": "queued",
                 "outcome": None,
-                "month": ticket.month,
-                "plan_sha256": ticket.plan_sha256,
+                "month": reserved_ticket.month,
+                "plan_sha256": reserved_ticket.plan_sha256,
                 "created_at": _utc_now_text(),
                 "started_at": None,
                 "finished_at": None,
@@ -405,7 +542,7 @@ class ApprovalService:
 
         worker = threading.Thread(
             target=self._run_job,
-            args=(job_id, copy.copy(ticket)),
+            args=(job_id, reserved_ticket),
             name=f"srdpm-approval-{job_id[:8]}",
             daemon=True,
         )
@@ -556,6 +693,7 @@ class ApprovalService:
                 "csrf_header": "X-SRDPM-CSRF",
                 "csrf_token": self.csrf_token,
                 "instance_id": self.instance_id,
+                "service_build_id": SERVICE_BUILD_ID,
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -717,6 +855,14 @@ class LocalApprovalRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
 
+            if path == "/api/v1/credentials/status":
+                self._require_api_security(require_origin=False)
+                self._send_json(
+                    200,
+                    {"ok": True, "credentials": self.service.credentials_status()},
+                )
+                return
+
             match = JOB_PATH_PATTERN.fullmatch(path)
             if match:
                 self._require_api_security(require_origin=False)
@@ -734,6 +880,13 @@ class LocalApprovalRequestHandler(BaseHTTPRequestHandler):
             self._require_api_security(require_origin=True)
             path = urlsplit(self.path).path
             data = self._read_json_body()
+            if path == "/api/v1/credentials/configure":
+                request = self._require_exact_object(data, {"username", "password"})
+                result = self.service.configure_credentials(
+                    request["username"], request["password"]
+                )
+                self._send_json(200, {"ok": True, "credentials": result})
+                return
             if path == "/api/v1/approval/prepare":
                 request = self._require_exact_object(data, {"month", "group_keys"})
                 result = self.service.prepare(request["month"], request["group_keys"])
@@ -767,7 +920,10 @@ def create_server(
     port: int = DEFAULT_PORT,
     project_dir: Path = PROJECT_DIR,
     archive_root: Path | None = None,
-    client_factory: Callable[[], Any] = SRDPMClient.from_env,
+    client_factory: Callable[[], Any] | None = None,
+    credential_store: Any | None = None,
+    credential_client_factory: Callable[[str, str], Any] = SRDPMClient.from_credentials,
+    approval_confirmer: Callable[[PlanSummary], bool] = confirm_approval_with_windows,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> LocalApprovalHTTPServer:
     if isinstance(port, bool) or not isinstance(port, int) or not (0 <= port <= 65_535):
@@ -776,6 +932,9 @@ def create_server(
         project_dir=project_dir,
         archive_root=archive_root,
         client_factory=client_factory,
+        credential_store=credential_store,
+        credential_client_factory=credential_client_factory,
+        approval_confirmer=approval_confirmer,
         monotonic=monotonic,
     )
     return LocalApprovalHTTPServer((LISTEN_HOST, port), service)
@@ -785,24 +944,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="启动仅供本机使用的 SRDPM 工时审批看板")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="本机端口，默认 8765")
     parser.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
+    parser.add_argument("--quiet", action="store_true", help="后台模式，不输出控制台信息")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if not (1 <= args.port <= 65_535):
-        print("启动失败：--port 必须为 1 到 65535")
+        if not args.quiet:
+            print("启动失败：--port 必须为 1 到 65535")
         return 2
     try:
         server = create_server(port=args.port)
     except OSError as exc:
-        print(f"启动失败：无法绑定 {LISTEN_HOST}:{args.port}（{type(exc).__name__}）")
+        if not args.quiet:
+            print(f"启动失败：无法绑定 {LISTEN_HOST}:{args.port}（{type(exc).__name__}）")
         return 2
 
     url = server.origin + "/"
-    print(f"SRDPM 本机审批看板已启动：{url}")
-    print("仅监听 127.0.0.1；真实审批仍需页面二次确认。按 Ctrl+C 停止。")
-    print("本机服务与命令行真实审批共享跨进程互斥锁，拒绝并行提交。")
+    if not args.quiet:
+        print(f"SRDPM 本机审批看板已启动：{url}")
+        print("仅监听 127.0.0.1；真实审批仍需页面二次确认。按 Ctrl+C 停止。")
+        print("本机服务与命令行真实审批共享跨进程互斥锁，拒绝并行提交。")
     if args.open:
         timer = threading.Timer(0.25, lambda: webbrowser.open(url))
         timer.daemon = True
@@ -810,7 +973,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
-        print("\n正在停止本机审批看板...")
+        if not args.quiet:
+            print("\n正在停止本机审批看板...")
     finally:
         server.server_close()
     return 0

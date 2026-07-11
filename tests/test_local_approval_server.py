@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from unittest.mock import patch
 
 from approval_model import make_group_key
 from local_approval_server import (
     DASHBOARD_NAME,
     MAX_HTTP_BODY_BYTES,
+    SERVICE_BUILD_ID,
     ServiceError,
     create_server,
     rebuild_plan_from_archive,
 )
+from windows_credential_store import Credentials
 
 
 class FakeClock:
@@ -28,6 +32,22 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+class FakeCredentialStore:
+    def __init__(self) -> None:
+        self.credentials: Credentials | None = None
+        self.save_calls: list[tuple[str, str]] = []
+
+    def has_credentials(self) -> bool:
+        return self.credentials is not None
+
+    def load(self) -> Credentials | None:
+        return self.credentials
+
+    def save(self, username: str, password: str) -> None:
+        self.save_calls.append((username, password))
+        self.credentials = Credentials(username, password)
 
 
 class FakeClient:
@@ -46,9 +66,11 @@ class FakeClient:
         self.approve_calls: list[tuple[str, ...]] = []
         self.status_calls: list[tuple[str, str]] = []
         self.status_user_ids: list[str | None] = []
+        self.check_live_calls = 0
         self.closed = False
 
     def check_live(self) -> bool:
+        self.check_live_calls += 1
         return True
 
     def get_pending_ids(
@@ -99,6 +121,12 @@ def _child(approve_id: str, title: str) -> dict[str, Any]:
 
 class LocalApprovalServerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.environment = patch.dict(
+            os.environ,
+            {"SRDPM_USERNAME": "", "SRDPM_PASSWORD": ""},
+        )
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         (self.root / DASHBOARD_NAME).write_text(
@@ -148,6 +176,10 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.group_b = make_group_key("2026-07-09", "测试人员B")
         self.group_c = make_group_key("2026-07-10", "测试人员C")
         self.clock = FakeClock()
+        self.credential_store = FakeCredentialStore()
+        self.credential_validation_inputs: list[tuple[str, str]] = []
+        self.credential_clients: list[FakeClient] = []
+        self.native_confirmation_summaries: list[Any] = []
         self.clients: list[FakeClient] = []
         self.client_builder = self._success_client
 
@@ -156,11 +188,24 @@ class LocalApprovalServerTests(unittest.TestCase):
             self.clients.append(client)
             return client
 
+        def credential_factory(username: str, password: str) -> FakeClient:
+            self.credential_validation_inputs.append((username, password))
+            client = self._success_client()
+            self.credential_clients.append(client)
+            return client
+
+        def approval_confirmer(summary: Any) -> bool:
+            self.native_confirmation_summaries.append(summary)
+            return True
+
         self.server = create_server(
             port=0,
             project_dir=self.root,
             archive_root=self.archive,
             client_factory=factory,
+            credential_store=self.credential_store,
+            credential_client_factory=credential_factory,
+            approval_confirmer=approval_confirmer,
             monotonic=self.clock,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -268,6 +313,8 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertIn('id="srdpm-local-service-config"', html)
         self.assertIn(self.server.service.csrf_token, html)
         self.assertIn(self.server.service.instance_id, html)
+        self.assertIn(SERVICE_BUILD_ID, html)
+        self.assertRegex(SERVICE_BUILD_ID, r"^[0-9a-f]{16}$")
         self.assertIn("default-src 'self'", headers["content-security-policy"])
         self.assertEqual("DENY", headers["x-frame-options"])
         self.assertEqual("nosniff", headers["x-content-type-options"])
@@ -290,6 +337,59 @@ class LocalApprovalServerTests(unittest.TestCase):
                 self.assertEqual(403, status)
                 self.assertNotIn("access-control-allow-origin", headers)
         self.assertEqual([], self.clients)
+
+    def test_credentials_are_validated_read_only_then_saved_without_echo(self) -> None:
+        status, _, body = self._request("GET", "/api/v1/credentials/status")
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"configured": False, "source": None}, body["credentials"]
+        )
+
+        username = "offline-user"
+        password = "offline-password-never-echo"
+        status, _, body = self._request(
+            "POST",
+            "/api/v1/credentials/configure",
+            {"username": username, "password": password},
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual(
+            {"configured": True, "source": "windows_credential_manager"},
+            body["credentials"],
+        )
+        self.assertNotIn(username, json.dumps(body, ensure_ascii=False))
+        self.assertNotIn(password, json.dumps(body, ensure_ascii=False))
+        self.assertEqual([(username, password)], self.credential_validation_inputs)
+        self.assertEqual([(username, password)], self.credential_store.save_calls)
+        self.assertEqual(1, self.credential_clients[0].check_live_calls)
+        self.assertTrue(self.credential_clients[0].closed)
+
+        status, _, body = self._request("GET", "/api/v1/credentials/status")
+        self.assertEqual(200, status)
+        self.assertTrue(body["credentials"]["configured"])
+
+    def test_failed_credential_validation_never_saves_or_echoes_secret(self) -> None:
+        password = "invalid-password-never-echo"
+
+        class RejectingClient(FakeClient):
+            def check_live(self) -> bool:
+                self.check_live_calls += 1
+                raise RuntimeError("offline rejected login")
+
+        self.server.service.credential_client_factory = (
+            lambda username, supplied: RejectingClient(pending={}, approved={})
+        )
+        status, _, body = self._request(
+            "POST",
+            "/api/v1/credentials/configure",
+            {"username": "bad-user", "password": password},
+        )
+
+        self.assertEqual(401, status)
+        rendered = json.dumps(body, ensure_ascii=False)
+        self.assertNotIn("bad-user", rendered)
+        self.assertNotIn(password, rendered)
+        self.assertEqual([], self.credential_store.save_calls)
 
     def test_options_is_405_without_cors_headers(self) -> None:
         status, headers, body = self._request("OPTIONS", "/api/v1/approval/prepare")
@@ -391,6 +491,19 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertEqual(1, len(self.clients))
         self.assertEqual(1, len(self.clients[0].approve_calls))
 
+    def test_native_confirmation_is_required_and_rejection_consumes_ticket(self) -> None:
+        prepared = self._prepare([self.group_a])
+        self.server.service.approval_confirmer = lambda summary: False
+
+        status, body = self._execute(prepared["ticket"])
+
+        self.assertEqual(409, status)
+        self.assertEqual("native_confirmation_rejected", body["error"]["code"])
+        self.assertEqual([], self.clients)
+        second_status, second_body = self._execute(prepared["ticket"])
+        self.assertEqual(409, second_status)
+        self.assertEqual("ticket_used", second_body["error"]["code"])
+
     def test_success_rechecks_and_only_marks_readback_success_verified(self) -> None:
         prepared = self._prepare([self.group_a, self.group_b])
         status, body = self._execute(prepared["ticket"])
@@ -409,6 +522,30 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertEqual([None, "u-b", None, "u-b"], client.pending_user_ids)
         self.assertEqual([None, "u-b"], client.status_user_ids)
         self.assertTrue(client.closed)
+        self.assertEqual(1, len(self.native_confirmation_summaries))
+        native_summary = self.native_confirmation_summaries[0]
+        self.assertEqual(2, native_summary.group_count)
+        self.assertEqual(prepared["summary"]["sha256"], native_summary.sha256)
+
+    def test_background_job_uses_stored_windows_credentials(self) -> None:
+        self.credential_store.credentials = Credentials(
+            "stored-offline-user", "stored-offline-password"
+        )
+        self.server.service.client_factory = (
+            self.server.service._client_from_configured_credentials
+        )
+        prepared = self._prepare([self.group_a])
+        status, body = self._execute(prepared["ticket"])
+        self.assertEqual(202, status)
+        job = self._wait_job(body["job"]["job_id"])
+
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual(
+            [("stored-offline-user", "stored-offline-password")],
+            self.credential_validation_inputs,
+        )
+        self.assertEqual(1, len(self.credential_clients[0].approve_calls))
+        self.assertTrue(self.credential_clients[0].closed)
 
     def test_second_group_preflight_drift_maps_to_its_stable_group_key(self) -> None:
         self.client_builder = lambda: FakeClient(
@@ -479,11 +616,12 @@ class LocalApprovalServerTests(unittest.TestCase):
         )
         self._write_raw()
         status, body = self._execute(prepared["ticket"])
-        self.assertEqual(202, status)
-        job = self._wait_job(body["job"]["job_id"])
-        self.assertEqual("failed", job["status"])
-        self.assertEqual("rejected_no_change", job["outcome"])
-        self.assertIn("归档在确认后发生变化", job["message"])
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "archive_changed_before_confirmation", body["error"]["code"]
+        )
+        self.assertIn("归档在清单确认前发生变化", body["error"]["message"])
+        self.assertEqual([], self.native_confirmation_summaries)
         self.assertEqual([], self.clients)
 
     def test_client_configuration_failure_is_rejected_without_unknown_state(self) -> None:
