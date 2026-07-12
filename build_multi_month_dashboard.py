@@ -113,6 +113,64 @@ def build_category_data(data, md_text, raw_data=None):
             return "approved"
         return "pending"
 
+    def exact_approval_ids(
+        date, person, *, items=None, title=None, content=None, hours=None, explicit_id=None
+    ):
+        """Return one exact raw approval ID, or fail closed when ambiguous.
+
+        Category four is an exception *detail*, not a whole person-day.  Audit
+        JSON predates the explicit approval-ID field, so old archives are
+        matched against the raw child using its stable visible business fields.
+        More than one matching child is intentionally not selectable: widening
+        that row to a whole day was the source of accidental approvals.
+        """
+
+        explicit = str(explicit_id or "").strip()
+        candidates = []
+        for record in raw_children:
+            if record["date"] != date or record["person"] != person:
+                continue
+            approve_id = str(record.get("approve_id") or "").strip()
+            if not approve_id:
+                continue
+            child = record["child"]
+            if explicit and approve_id != explicit:
+                continue
+            if items is not None and str(child.get("items") or "") != str(items or ""):
+                continue
+            if title is not None and str(child.get("title") or "") != str(title or ""):
+                continue
+            if content is not None and str(child.get("content") or "").strip() != str(content or "").strip():
+                continue
+            if hours is not None:
+                try:
+                    if float(child.get("work_hours", 0) or 0) != float(hours or 0):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            candidates.append(approve_id)
+        candidates = normalize_approve_ids(candidates)
+        if len(candidates) == 1:
+            return candidates, None
+        if not candidates:
+            return [], "未能在当前原始归档中定位此条 SRDPM 明细"
+        return [], "此条异常匹配到多条 SRDPM 明细，已停止选择以避免误批"
+
+    def status_for_ids(approve_ids):
+        records = {
+            record["approve_id"]: record
+            for record in raw_children
+            if record.get("approve_id")
+        }
+        matched = [records.get(approve_id) for approve_id in normalize_approve_ids(approve_ids)]
+        if not matched or any(record is None for record in matched):
+            return "pending"
+        return (
+            "approved"
+            if all(record["child"].get("status") == "通过" for record in matched)
+            else "pending"
+        )
+
     # 平台数据必须直接使用结构化 JSON。旧实现反向解析 Markdown 表格，
     # 工作内容含换行时会整行丢失（2026-07 曾由 52 条误变成 31 条）。
     platform_data = []
@@ -126,6 +184,14 @@ def build_category_data(data, md_text, raw_data=None):
                 hours = float(entry.get("work_hours", 0) or 0)
             except (TypeError, ValueError):
                 hours = 0.0
+            approve_ids, unavailable_reason = exact_approval_ids(
+                date,
+                person,
+                items=project,
+                title=title,
+                content=content,
+                hours=hours,
+            )
             platform_data.append({
                 "date": date,
                 "person": person,
@@ -133,7 +199,9 @@ def build_category_data(data, md_text, raw_data=None):
                 "title": title,
                 "content": content,
                 "hours": hours,
-                "status": determine_status(date, person, project, title)
+                "status": status_for_ids(approve_ids),
+                "approve_ids": ",".join(approve_ids),
+                "approval_unavailable_reason": unavailable_reason,
             })
 
     # Dedup
@@ -156,7 +224,7 @@ def build_category_data(data, md_text, raw_data=None):
         "title": "一、漏报人员",
         "desc": "无漏报人员" if not data.get("missed") else f"{len(data['missed'])}人漏报（截止 {data.get('missed_cutoff', '未知')}）",
         "items": [],
-        "auto_approve": False,  # 不自动审批
+        "approval_candidate": False,
         "no_approval": True     # 标记：无审批按钮（漏报没有东西可审批）
     }
     for person, dates in data.get("missed", {}).items():
@@ -171,13 +239,22 @@ def build_category_data(data, md_text, raw_data=None):
     # 二、请假/出差 - 直接审批
     cats["two"] = {
         "title": "二、请假/出差/休假",
-        "desc": f"{len(data.get('no_checkin_leave', []))}条记录 ⭐ 直接审批",
+        "desc": f"{len(data.get('no_checkin_leave', []))}条记录 · 可选择审批",
         "items": [],
-        "auto_approve": True,     # 直接审批
+        "approval_candidate": True,
         "suggest_approve": True
     }
     for entry in data.get("no_checkin_leave", []):
         for child in entry.get("children", []):
+            approve_ids, unavailable_reason = exact_approval_ids(
+                entry["date"],
+                entry["person"],
+                items=child.get("items", ""),
+                title=child.get("title", ""),
+                content=child.get("content", "").strip(),
+                hours=child.get("work_hours", 0),
+                explicit_id=child.get("approve_id"),
+            )
             cats["two"]["items"].append({
                 "date": entry["date"],
                 "person": entry["person"],
@@ -185,7 +262,9 @@ def build_category_data(data, md_text, raw_data=None):
                 "title": child.get("title", ""),
                 "content": child.get("content", "").strip(),
                 "hours": float(child.get("work_hours", 0)),
-                "status": determine_status(entry["date"], entry["person"], child.get("items"), child.get("title"))
+                "status": status_for_ids(approve_ids),
+                "approve_ids": ",".join(approve_ids),
+                "approval_unavailable_reason": unavailable_reason,
             })
 
     # 三、工时异常（含无打卡合并的申报远大于打卡） - 需人工审核，有审核按钮和SRDPM审批对接
@@ -193,7 +272,7 @@ def build_category_data(data, md_text, raw_data=None):
         "title": "三、工时异常",
         "subtitle": "3.1 申报超过打卡(含无打卡) + 3.2 申报远低于打卡(<70%)",
         "items": [],
-        "auto_approve": False,
+        "approval_candidate": False,
         "manual_approve": True    # 标记：需人工审核，有审核按钮
     }
 
@@ -275,12 +354,19 @@ def build_category_data(data, md_text, raw_data=None):
         "title": "四、项目归属异常",
         "subtitle": f"4.2 其他人员项目归属异常：{len(data.get('project_mismatch', []))}条",
         "items": [],
-        "auto_approve": False,
+        "approval_candidate": False,
         "manual_approve": True    # 标记：需人工审核，有审核按钮
     }
     for entry in data.get("project_mismatch", []):
-        # 单条异常的 approve_id 是该子项自己的，但审批需要整个人的当天所有项一起批
-        approve_ids = get_person_day_approve_ids(raw_data, entry["date"], entry["person"])
+        # 项目归属异常只绑定这条异常明细；绝不再扩大为同日整单。
+        approve_ids, unavailable_reason = exact_approval_ids(
+            entry["date"],
+            entry["person"],
+            items=entry.get("items", ""),
+            title=entry.get("title", ""),
+            content=entry.get("content", "").strip(),
+            hours=entry.get("work_hours", 0),
+        )
         cats["four"]["items"].append({
             "date": entry["date"],
             "person": entry["person"],
@@ -291,8 +377,9 @@ def build_category_data(data, md_text, raw_data=None):
             "hours": float(entry.get("work_hours", 0)),
             "allowed": ", ".join(entry.get("allowed_chips", [])),
             "reason": entry.get("reason", ""),
-            "status": determine_status(entry["date"], entry["person"], entry.get("items"), entry.get("title")),
-            "approve_ids": ",".join(approve_ids)
+            "status": status_for_ids(approve_ids),
+            "approve_ids": ",".join(approve_ids),
+            "approval_unavailable_reason": unavailable_reason,
         })
 
     # 五、公共事务/平台类
@@ -300,7 +387,7 @@ def build_category_data(data, md_text, raw_data=None):
         "title": "五、公共事务/平台类",
         "desc": f"{len(platform_dedup)}条（去重后，不判违规）",
         "items": platform_dedup,
-        "auto_approve": True
+        "approval_candidate": True
     }
 
     # 七、其他待定（无法归入1-6类的条目）
@@ -308,11 +395,11 @@ def build_category_data(data, md_text, raw_data=None):
         "title": "七、其他待定",
         "desc": "无法归入以上1-6类的条目",
         "items": [],
-        "auto_approve": False,
+        "approval_candidate": False,
         "no_approval": True
     }
 
-    # 六、正常申报（自动审核）
+    # 六、正常申报（可选择审批）
     # 收集所有不在异常列表中的申报条目：工时正常、项目归属正常、非平台类
     abnormal_days = set()  # (date, person) 组合，标记为工时异常或请假出差的日子
     for entry in data.get("hours_over", []):
@@ -354,7 +441,7 @@ def build_category_data(data, md_text, raw_data=None):
             content = child.get("content", "")
             if any(kw in (title + content) for kw in ["出差", "休假", "请假", "leave", "Leave"]):
                 continue
-            # 正常条目。审批仍按人员+日期整单执行，行仅用于展示明细。
+            # 正常条目按这一条 SRDPM 明细选择，避免扩大为人员日期整单。
             normal_items.append({
                 "date": day_date,
                 "person": person,
@@ -363,14 +450,15 @@ def build_category_data(data, md_text, raw_data=None):
                 "content": content.strip(),
                 "hours": float(child.get("work_hours", 0)),
                 "approve_id": record["approve_id"],
+                "approve_ids": record["approve_id"],
                 "status": "approved" if child.get("status") == "通过" else "pending",
             })
 
     cats["six"] = {
         "title": "六、正常申报",
-        "desc": f"{len(normal_items)}条 · 工时正常且项目归属正确 ⭐ 可自动审核",
+        "desc": f"{len(normal_items)}条 · 工时正常且项目归属正确 · 可选择审批",
         "items": normal_items,
-        "auto_approve": True,
+        "approval_candidate": True,
         "suggest_approve": True
     }
 
@@ -506,7 +594,11 @@ def main():
     for ml in months:
         audit_data, raw_data, md_text = load_month_audit(ml)
         cats = build_category_data(audit_data, md_text, raw_data)
-        approval_groups = build_approval_groups(raw_data, manual_pairs_from_categories(cats))
+        approval_groups = build_approval_groups(
+            raw_data,
+            manual_pairs_from_categories(cats),
+            categories=cats,
+        )
         assign_primary_categories(cats, approval_groups)
         attach_groups_to_categories(cats, approval_groups)
         represented_group_keys = {
@@ -520,7 +612,7 @@ def main():
                 cats["seven"]["items"].append({
                     "date": group["date"],
                     "person": group["person"],
-                    "detail": f"未被1-6类覆盖的审批整单，共{group['item_count']}条明细",
+                    "detail": f"未被1-6类覆盖的审批明细选择，共{group['item_count']}条明细",
                 })
         approval_summary = summarize_groups(approval_groups)
         enhanced = build_enhanced_stats(raw_data)
@@ -714,9 +806,9 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 <div class="category-nav" id="categoryNav"></div>
 
 <div class="toolbar">
-    <button class="btn-execute" id="btnExecute" onclick="executeSelectedApprovals()">✅ 直接审批已选整单</button>
+    <button class="btn-execute" id="btnExecute" onclick="executeSelectedApprovals()">✅ 直接审批已选明细</button>
     <button class="btn-confirm" id="btnConfirm" onclick="confirmApprovals()">⬇️ 导出 JSON 备用</button>
-    <button class="btn-info" onclick="selectAllAutoGroups()">⭐ 全选全部自动候选</button>
+    <button class="btn-info" onclick="selectAllAutoGroups()">⭐ 全选全部可审批候选</button>
     <button class="btn-info" onclick="toggleInstructions()">📖 审批操作方法</button>
     <button class="btn-info" onclick="resetAll()">🔄 重置审批状态</button>
     <button class="btn-info" onclick="toggleStats()">📊 统计分析</button>
@@ -775,11 +867,11 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
     <div class="instructions">
         <h3>📖 安全审批操作步骤</h3>
         <ol>
-            <li>先逐个处理“三、工时异常”和“四、项目归属异常”；按钮选择的是<b>人员+日期整单</b>。</li>
-            <li>点击工具栏“全选全部自动候选”；含异常的整单会自动跳过，各分类中的重复展示不会重复计数。</li>
-            <li>点击“直接审批已选整单”；页面会自动连接后台本机服务。首次使用时在 UI 内配置一次登录信息。</li>
+            <li>先逐个处理“三、工时异常”和“四、项目归属异常”；第四类按钮只选择当前这一条 SRDPM 明细，不会带上同日正常项目。</li>
+            <li>点击工具栏“全选全部可审批候选”可选择本类全部明细；系统只在你点击“直接审批”后才会提交。</li>
+            <li>点击“直接审批已选明细”；页面会自动连接后台本机服务。首次使用时在 UI 内配置一次登录信息。</li>
             <li>逐行核对人员、日期、审核来源、项目、工时和影响范围后确认一次；本机服务会完成校验、真实审批和结果回读。</li>
-            <li>只有 SRDPM 回读明确为“通过”的整单才会在页面标记为已审批；失败或状态未知的整单会保留选择，且不会自动重试。</li>
+            <li>只有 SRDPM 回读明确为“通过”的所选明细才会在页面标记为已审批；失败或状态未知的选择会保留，且不会自动重试。</li>
             <li>“导出 JSON 备用”仍可用于离线核对，导出本身<b>不会修改 SRDPM</b>。</li>
         </ol>
         <p style="margin-top:10px;font-size:12px;color:#888;">⚠️ SRDPM审批不可撤回。后台服务由 Windows 自动启动；登录凭据只保存在当前用户的 Windows 凭据管理器中。</p>
@@ -830,7 +922,7 @@ let currentCatKey = "one";
 // localStorage 只保存“已选择”；已审批只来自归档或本次服务端回读结果。
 // 服务端每次仍从归档重建白名单并实时复检，不信任浏览器状态。
 let approvalState = {};
-const STORAGE_PREFIX = "srdpm_approval_v2_";
+const STORAGE_PREFIX = "srdpm_approval_v3_";
 let approvalExecutionActive = false;
 
 function getStorageKey(month) { return STORAGE_PREFIX + month; }
@@ -901,7 +993,7 @@ function deriveCounts(groupKeys = Object.keys(APPROVAL_GROUPS)) {
 }
 
 // ===== 月份切换 =====
-const AUTO_CATS = ["two", "five", "six"];
+const CANDIDATE_CATS = ["two", "five", "six"];
 const MANUAL_APPROVE_CATS = ["three", "four"];
 const APPROVE_CATS = ["two", "three", "four", "five", "six"];
 const NO_APPROVE_CATS = ["one", "seven"];        // 无审批按钮的分类（漏报、其他待定）
@@ -930,9 +1022,9 @@ function updateLocalServiceStatus() {
 function buildLocalServiceTransferUrl(plan) {
     const params = new URLSearchParams();
     params.set("approval_selection", JSON.stringify({
-        version: 1,
+        version: 2,
         month: plan.month,
-        group_keys: plan.groups.map(group => group.group_key)
+        group_keys: plan.selection_keys
     }));
     return `${LOCAL_SERVICE_ORIGIN}/#${params.toString()}`;
 }
@@ -948,7 +1040,7 @@ function importTransferredApprovalSelection() {
         const payload = JSON.parse(encoded);
         const keys = Object.keys(payload || {}).sort();
         const groupKeys = payload?.group_keys;
-        if (keys.join(",") !== "group_keys,month,version" || payload.version !== 1 ||
+        if (keys.join(",") !== "group_keys,month,version" || payload.version !== 2 ||
             !Object.prototype.hasOwnProperty.call(ALL_DATA, payload.month) ||
             !Array.isArray(groupKeys) || groupKeys.length < 1 || groupKeys.length > 200 ||
             new Set(groupKeys).size !== groupKeys.length ||
@@ -957,7 +1049,7 @@ function importTransferredApprovalSelection() {
         }
         if (payload.month !== currentMonth) switchMonth(payload.month);
         if (groupKeys.some(groupKey => !APPROVAL_GROUPS[groupKey])) {
-            throw new Error("转交的整单已不在当前看板中");
+            throw new Error("转交的审批明细已不在当前看板中");
         }
         approvalState = {};
         for (const groupKey of groupKeys) {
@@ -968,7 +1060,7 @@ function importTransferredApprovalSelection() {
         switchTab(currentCatKey);
         return Object.keys(approvalState).length > 0;
     } catch (error) {
-        setApprovalFeedback("error", `无法导入所选整单：${error.message || "格式错误"}`);
+        setApprovalFeedback("error", `无法导入所选明细：${error.message || "格式错误"}`);
         return false;
     }
 }
@@ -983,7 +1075,7 @@ function renderMonthSelector() {
         const autoGroups = summary.auto_pending_groups || 0;
         const isActive = ml === currentMonth;
         html += `<button class="month-btn ${isActive ? 'active' : ''}" data-month="${ml}" onclick="switchMonth('${ml}')">
-            ${escapeHtml(md)}<span class="badge">${manualGroups}人工</span>${autoGroups > 0 ? `<span class="badge" style="background:#1a7a1a;color:#fff;">${autoGroups}自动</span>` : ''}
+            ${escapeHtml(md)}<span class="badge">${manualGroups}人工</span>${autoGroups > 0 ? `<span class="badge" style="background:#1a7a1a;color:#fff;">${autoGroups}候选</span>` : ''}
         </button>`;
     }
     sel.innerHTML = html;
@@ -1032,7 +1124,7 @@ function renderCategoryNav() {
             const counts = deriveCounts(groupKeys);
             if (groupKeys.length === 0 && rowCount > 0) {
                 cls = "auto";
-                statusText = `明细视图 · ${rowCount}条 · 审批随所属整单`;
+                statusText = `明细视图 · ${rowCount}条 · 审批随所属选择`;
                 html += `<button class="cat-nav-item ${cls}" data-cat="${key}" onclick="switchTab('${key}')">
                     <span>${escapeHtml(cat.title)}</span>
                     <span class="cat-status">${statusText}</span>
@@ -1046,8 +1138,8 @@ function renderCategoryNav() {
             const approved = counts.manual.approved + counts.auto.approved;
             cls = pending === 0 && selected === 0 ? "complete" : (manualTotal > 0 ? "manual" : "auto");
             const modeText = manualTotal > 0 && autoTotal > 0
-                ? `人工${manualTotal}单/自动${autoTotal}单`
-                : (manualTotal > 0 ? `人工${manualTotal}单` : `自动${autoTotal}单`);
+                ? `人工${manualTotal}条/候选${autoTotal}条`
+                : (manualTotal > 0 ? `人工${manualTotal}条` : `候选${autoTotal}条`);
             statusText = `${modeText} · 待处理${pending} · 已选${selected} · 已审批${approved} · ${rowCount}条明细`;
         }
 
@@ -1097,7 +1189,7 @@ function renderBulkActions(key) {
     const allViewGroupKeys = groupKeysForCategory(key, false);
     const viewCounts = deriveCounts(allViewGroupKeys);
     const hasAutoPending = viewCounts.auto.pending > 0;
-    const selectedCount = AUTO_CATS.includes(key)
+    const selectedCount = CANDIDATE_CATS.includes(key)
         ? viewCounts.auto.selected
         : viewCounts.manual.selected;
     const routedManualCount = allViewGroupKeys.filter(groupKey => {
@@ -1106,15 +1198,15 @@ function renderBulkActions(key) {
     }).length;
     let html = '<div class="bulk-actions">';
     if (hasAutoPending) {
-        html += `<button class="btn-info" onclick="selectCategoryGroups('${key}', 'auto', true)">⭐ 全选本类自动候选（${viewCounts.auto.pending}单）</button>`;
+        html += `<button class="btn-info" onclick="selectCategoryGroups('${key}', 'auto', true)">⭐ 全选本类候选（${viewCounts.auto.pending}条）</button>`;
     }
     if (selectedCount > 0) {
-        html += `<button class="btn-info" onclick="clearCategorySelection('${key}')">取消本类选择（${selectedCount}单）</button>`;
+        html += `<button class="btn-info" onclick="clearCategorySelection('${key}')">取消本类选择（${selectedCount}条）</button>`;
     }
-    if (routedManualCount > 0 && AUTO_CATS.includes(key)) {
-        html += `<span class="bulk-note">其中 ${routedManualCount} 个人日含异常，操作已归入异常分类，本类不重复计数。</span>`;
+    if (routedManualCount > 0 && CANDIDATE_CATS.includes(key)) {
+        html += `<span class="bulk-note">其中 ${routedManualCount} 条含异常的选择已归入异常分类，本类不重复计数。</span>`;
     } else if (MANUAL_APPROVE_CATS.includes(key)) {
-        html += '<span class="bulk-note">人工异常必须逐个人员日期整单确认，此处不提供批量全选。</span>';
+        html += '<span class="bulk-note">人工异常必须逐条核对确认，此处不提供批量全选。</span>';
     }
     html += '</div>';
     return html;
@@ -1149,7 +1241,7 @@ function clearCategorySelection(catKey) {
     if (approvalExecutionActive) return;
     for (const groupKey of groupKeysForCategory(catKey, false)) {
         const group = APPROVAL_GROUPS[groupKey];
-        if (AUTO_CATS.includes(catKey) && group?.review_mode !== "auto") continue;
+        if (CANDIDATE_CATS.includes(catKey) && group?.review_mode !== "auto") continue;
         delete approvalState[groupKey];
     }
     saveState();
@@ -1167,7 +1259,7 @@ function renderPanel(key) {
     html += `<div class="panel-desc">${escapeHtml(cat.desc || cat.subtitle || "")}</div>`;
 
     if (cat.items.length === 0) {
-        const emoji = cat.auto_approve ? "✅" : "📭";
+        const emoji = cat.approval_candidate ? "✅" : "📭";
         html += `<div class="empty-state"><div class="icon">${emoji}</div>${escapeHtml(cat.desc || "无数据")}</div>`;
     } else {
         // 初始化分页状态
@@ -1290,12 +1382,14 @@ function renderTable(key, cat) {
                 let text;
                 if (status === "approved") {
                     text = "SRDPM已审批";
+                } else if (status === "info" && item.approval_unavailable_reason) {
+                    text = "无法安全定位";
                 } else if (!isPrimaryView) {
-                    text = status === "selected" ? `已在${primaryTitle}选择` : `随${primaryTitle}整单处理`;
+                    text = status === "selected" ? `已在${primaryTitle}选择` : `随${primaryTitle}处理`;
                 } else if (status === "selected") {
-                    text = isManualGroup ? "人工已标记" : "已选自动审批";
+                    text = isManualGroup ? "人工已标记" : "已选候选";
                 } else {
-                    text = isManualGroup ? "待人工审核" : "可自动审批";
+                    text = isManualGroup ? "待人工审核" : "可选择审批";
                 }
                 tableHtml += `<td class="nowrap"><span class="status-badge ${cls}">${escapeHtml(text)}</span></td>`;
             } else if (col === "action") {
@@ -1307,14 +1401,15 @@ function renderTable(key, cat) {
                 if (status === "approved") {
                     tableHtml += `<td class="nowrap"><span style="color:#1a7a1a;font-size:13px;">✓ 服务器已通过</span></td>`;
                 } else if (status === "selected") {
-                    const undoText = isManualGroup ? "撤销整单标记" : "取消整单选择";
+                    const undoText = isManualGroup ? "撤销此条标记" : "取消此条选择";
                     tableHtml += `<td class="nowrap"><button class="btn-approve done" onclick="toggleApproval('${key}', ${i})">${undoText}</button></td>`;
                 } else if (!isPrimaryView && isManualGroup) {
                     tableHtml += `<td class="nowrap"><button class="btn-info" onclick="switchTab('${primaryCategory}')">前往${escapeHtml(primaryTitle)}</button></td>`;
                 } else if (status === "info") {
                     tableHtml += '<td class="nowrap">无审批批次</td>';
                 } else {
-                    const btnText = isManualGroup ? "标记整单通过" : "⭐ 选择整单";
+                    const scope = group.scope === "整日" ? "整日范围" : "此条明细";
+                    const btnText = isManualGroup ? `标记${scope}通过` : `⭐ 选择${scope}`;
                     tableHtml += `<td class="nowrap"><button class="btn-approve" onclick="toggleApproval('${key}', ${i})">${btnText}</button></td>`;
                 }
             } else if (col === "detail" || col === "content" || col === "missed_dates") {
@@ -1434,8 +1529,8 @@ function updatePendingCount() {
     const manualItems = manualOpen.reduce((sum, g) => sum + (g.approve_ids || []).length, 0);
     const autoItems = autoOpen.reduce((sum, g) => sum + (g.approve_ids || []).length, 0);
     document.getElementById("pendingCount").textContent =
-        `需人工审核：${manualOpen.length}个人日/${manualItems}条明细（已标记${manualSelected}） · ` +
-        `可自动审批：${autoOpen.length}个人日/${autoItems}条明细（已选${autoSelected}）`;
+        `需人工审核：${manualOpen.length}条选择/${manualItems}个待审ID（已标记${manualSelected}） · ` +
+        `可审批候选：${autoOpen.length}条选择/${autoItems}个待审ID（已选${autoSelected}）`;
 
     const selectedGroups = groups.filter(g => getGroupStatus(g.group_key) === "selected");
     const selectedItems = selectedGroups.reduce((sum, g) => sum + (g.approve_ids || []).length, 0);
@@ -1444,8 +1539,8 @@ function updatePendingCount() {
     if (selectedGroups.length > 0) {
         exportButton.classList.add("show");
         executeButton.classList.add("show");
-        exportButton.textContent = `⬇️ 导出 JSON 备用（${selectedGroups.length}个人日/${selectedItems}条明细）`;
-        executeButton.textContent = `✅ 直接审批已选整单（${selectedGroups.length}个人日/${selectedItems}条明细）`;
+        exportButton.textContent = `⬇️ 导出 JSON 备用（${selectedGroups.length}条选择/${selectedItems}个待审ID）`;
+        executeButton.textContent = `✅ 直接审批已选明细（${selectedGroups.length}条选择/${selectedItems}个待审ID）`;
     } else {
         exportButton.classList.remove("show");
         executeButton.classList.remove("show");
@@ -1455,44 +1550,49 @@ function updatePendingCount() {
 }
 
 function buildSelectedApprovalPlan() {
-    const groups = Object.values(APPROVAL_GROUPS)
+    const selections = Object.values(APPROVAL_GROUPS)
         .filter(group => getGroupStatus(group.group_key) === "selected")
         .sort((a, b) => `${a.date}|${a.person}`.localeCompare(`${b.date}|${b.person}`, "zh-CN"));
-    if (groups.length === 0) return null;
+    if (selections.length === 0) return null;
 
     const seenIds = new Set();
-    let duplicateId = null;
-    for (const group of groups) {
+    const executionGroups = new Map();
+    for (const group of selections) {
+        const identity = `${group.date}\u0000${group.person}\u0000${group.user_id || ""}`;
+        if (!executionGroups.has(identity)) {
+            executionGroups.set(identity, {
+                date: group.date,
+                person: group.person,
+                user_id: group.user_id || null,
+                approve_ids: new Set()
+            });
+        }
+        const executionGroup = executionGroups.get(identity);
         for (const approveId of (group.approve_ids || [])) {
-            if (seenIds.has(approveId)) duplicateId = approveId;
             seenIds.add(approveId);
+            executionGroup.approve_ids.add(approveId);
         }
     }
-    if (duplicateId) {
-        alert("审批计划生成失败：不同人员日期整单中出现重复审批ID。为避免误批，已停止操作。");
-        return null;
-    }
 
-    const manualGroupCount = groups.filter(group => group.review_mode === "manual").length;
-    const autoGroupCount = groups.length - manualGroupCount;
+    const manualSelectionCount = selections.filter(group => group.review_mode === "manual").length;
+    const autoSelectionCount = selections.length - manualSelectionCount;
     const plan = {
         schema_version: 1,
         month: currentMonth,
         generated_at: new Date().toISOString(),
         source_fetch_time: ALL_DATA[currentMonth].fetch_time || "",
+        selection_keys: selections.map(group => group.group_key),
         summary: {
-            group_count: groups.length,
+            selection_count: selections.length,
+            group_count: executionGroups.size,
             item_count: seenIds.size,
-            manual_group_count: manualGroupCount,
-            auto_group_count: autoGroupCount
+            manual_selection_count: manualSelectionCount,
+            auto_selection_count: autoSelectionCount
         },
-        groups: groups.map(group => ({
-            group_key: group.group_key,
+        groups: [...executionGroups.values()].map(group => ({
             date: group.date,
             person: group.person,
-            user_id: group.user_id || null,
-            review_mode: group.review_mode,
-            item_count: group.item_count,
+            user_id: group.user_id,
             approve_ids: [...group.approve_ids]
         }))
     };
@@ -1512,7 +1612,7 @@ function exportApprovalPlan() {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    alert(`已导出审批清单：${plan.summary.group_count}个人日、${plan.summary.item_count}条唯一明细。\n\n导出没有修改 SRDPM，可用于离线核对。`);
+    alert(`已导出审批清单：${plan.summary.selection_count}条选择、${plan.summary.item_count}个唯一待审ID。\n\n导出没有修改 SRDPM，可用于离线核对。`);
 }
 
 function confirmApprovals() {
@@ -1532,15 +1632,16 @@ function showPreparedApprovalConfirmation(prepared) {
     const manualCount = groups.filter(group => group.review_mode === "manual").length;
     const autoCount = groups.length - manualCount;
     document.getElementById("approvalConfirmSummary").textContent =
-        `${summary.month} · ${summary.group_count}个人日 · ${summary.id_count}个待审ID` +
-        `（人工确认${manualCount}单，自动候选${autoCount}单） · ` +
+        `${summary.month} · ${summary.selection_count || groups.length}条选择 · ` +
+        `${summary.id_count}个待审ID（执行${summary.group_count}个人日期批次）` +
+        `（人工确认${manualCount}条，可审批候选${autoCount}条） · ` +
         `清单校验码 ${String(summary.sha256 || "").slice(0, 12).toUpperCase()}`;
 
     const body = document.getElementById("approvalConfirmRows");
     body.replaceChildren();
     for (const group of groups) {
         const row = document.createElement("tr");
-        const source = `${group.review_mode === "manual" ? "人工异常" : "自动候选"} · ${group.review_summary || "未分类"}`;
+        const source = `${group.review_mode === "manual" ? "人工异常" : "可审批候选"} · ${group.review_summary || "未分类"}`;
         const projectValues = Array.isArray(group.projects) ? group.projects : [];
         const projectCount = Number(group.project_count || projectValues.length);
         const projects = projectValues.length
@@ -1552,7 +1653,7 @@ function showPreparedApprovalConfirmation(prepared) {
             source,
             projects,
             `${Number(group.work_hours || 0).toFixed(2)}h`,
-            `${group.item_count || group.id_count || 0}条明细 / ${group.id_count || 0}个待审ID`
+            `${group.scope || "明细"}范围 · ${group.item_count || group.id_count || 0}条 / ${group.id_count || 0}个待审ID`
         ];
         for (const value of values) {
             const cell = document.createElement("td");
@@ -1749,9 +1850,9 @@ function applyApprovalJobResult(job, executionMonth) {
     const notAttemptedRows = rows.filter(row => row.state === "not_attempted");
     const details = unknownRows.slice(0, 5).map(row => `${row.date} ${row.person}`).join("、");
     if (job.outcome === "succeeded") {
-        setApprovalFeedback("success", `审批完成：${verifiedRows.length}个人日已由 SRDPM 回读确认通过。\n本页已更新；下次重新打开前请重新拉取本月数据，以同步本地归档。`);
+        setApprovalFeedback("success", `审批完成：${verifiedRows.length}条所选明细已由 SRDPM 回读确认通过。\n本页已更新；下次重新打开前请重新拉取本月数据，以同步本地归档。`);
     } else if (job.outcome === "partial_success") {
-        setApprovalFeedback("warning", `部分完成：${verifiedRows.length}个人日已确认通过；${unknownRows.length}个人日状态未知；${notAttemptedRows.length}个人日未尝试。${details ? `\n状态未知：${details}${unknownRows.length > 5 ? "……" : ""}` : ""}\n请人工核对未成功整单，勿直接重复点击；重新打开前请先同步本月归档。`);
+        setApprovalFeedback("warning", `部分完成：${verifiedRows.length}条明细已确认通过；${unknownRows.length}条状态未知；${notAttemptedRows.length}条未尝试。${details ? `\n状态未知：${details}${unknownRows.length > 5 ? "……" : ""}` : ""}\n请人工核对未成功明细，勿直接重复点击；重新打开前请先同步本月归档。`);
     } else if (job.outcome === "state_unknown") {
         setApprovalFeedback("error", `审批结果存在未知状态。${details ? `请在 SRDPM 核对：${details}${unknownRows.length > 5 ? "……" : ""}` : "请到 SRDPM 人工核对。"}\n勿直接重复点击。`);
     } else {
@@ -1770,7 +1871,7 @@ async function executeSelectedApprovals() {
     }
 
     const executionMonth = currentMonth;
-    const groupKeys = plan.groups.map(group => group.group_key);
+    const groupKeys = plan.selection_keys;
     let executeRequestStarted = false;
     let jobStarted = false;
     setApprovalBusy(true);
@@ -1780,7 +1881,7 @@ async function executeSelectedApprovals() {
             setApprovalFeedback("info", "已取消登录配置，本次没有发送真实审批请求，原选择保留。");
             return;
         }
-        setApprovalFeedback("info", "正在由本机服务从当前归档重建并校验所选整单……");
+        setApprovalFeedback("info", "正在由本机服务从当前归档重建并校验所选明细……");
         const prepareData = await requestLocalApprovalApi("/approval/prepare", {
             method: "POST",
             body: {month: executionMonth, group_keys: groupKeys}
@@ -1788,14 +1889,15 @@ async function executeSelectedApprovals() {
         const prepared = prepareData.prepared;
         const summary = prepared?.summary;
         if (!prepared?.ticket || !summary || summary.month !== executionMonth ||
-            summary.group_count !== plan.summary.group_count || summary.id_count !== plan.summary.item_count) {
+            summary.selection_count !== plan.summary.selection_count ||
+            summary.id_count !== plan.summary.item_count) {
             throw new Error("页面数据与当前本地归档不一致，已停止审批；请重新生成并打开看板");
         }
         const preparedGroups = Array.isArray(prepared.groups) ? prepared.groups : [];
         const preparedKeys = new Set(preparedGroups.map(group => group.group_key));
         if (preparedGroups.length !== groupKeys.length ||
             groupKeys.some(groupKey => !preparedKeys.has(groupKey))) {
-            throw new Error("本机服务返回的核对清单与所选整单不一致，已停止审批");
+            throw new Error("本机服务返回的核对清单与所选明细不一致，已停止审批");
         }
         const confirmed = await showPreparedApprovalConfirmation(prepared);
         if (!confirmed) {
@@ -2073,10 +2175,10 @@ document.addEventListener("DOMContentLoaded", init);
         platform_rows = len(all_month_data[ml]["cats"]["five"]["items"])
         missed_people = len(all_month_data[ml]["cats"]["one"]["items"])
         print(
-            f"   {display}: 人工审核 {summary['manual_pending_groups']}个人日/"
-            f"{summary['manual_pending_items']}条明细 | 自动候选 "
-            f"{summary['auto_pending_groups']}个人日/{summary['auto_pending_items']}条明细 | "
-            f"平台关注 {platform_rows}条 | 已审批整单 {summary['approved_groups']}"
+            f"   {display}: 人工审核 {summary['manual_pending_groups']}条选择/"
+            f"{summary['manual_pending_items']}个待审ID | 可审批候选 "
+            f"{summary['auto_pending_groups']}条选择/{summary['auto_pending_items']}个待审ID | "
+            f"平台关注 {platform_rows}条 | 已审批选择 {summary['approved_groups']}"
             f"{' | ' + str(missed_people) + '人漏报' if missed_people else ''}"
         )
 

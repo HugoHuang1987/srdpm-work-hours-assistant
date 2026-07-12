@@ -139,6 +139,7 @@ class DashboardUiTests(unittest.TestCase):
                                 "summary": {
                                     "month": body["month"],
                                     "group_count": len(keys),
+                                    "selection_count": len(keys),
                                     "id_count": sum(expected["id_counts"][key] for key in keys),
                                     "person_count": len(keys),
                                     "date_count": len(keys),
@@ -183,27 +184,27 @@ class DashboardUiTests(unittest.TestCase):
         )
         return requests, expected
 
-    def test_initial_counts_use_person_day_groups_and_unique_ids(self):
+    def test_initial_counts_use_exact_selectable_rows_and_unique_ids(self):
         pending = self.page.locator("#pendingCount").inner_text()
         self.assertEqual(
             pending,
-            "需人工审核：4个人日/41条明细（已标记0） · 可自动审批：50个人日/443条明细（已选0）",
+            "需人工审核：4条选择/36个待审ID（已标记0） · 可审批候选：448条选择/448个待审ID（已选0）",
         )
         july_button = self.page.locator('.month-btn[data-month="2026-07"]')
         self.assertIn("4人工", july_button.inner_text())
-        self.assertIn("50自动", july_button.inner_text())
+        self.assertIn("448候选", july_button.inner_text())
 
         self.page.locator('.cat-nav-item[data-cat="five"]').click()
         platform_status = self.page.locator('.cat-nav-item[data-cat="five"] .cat-status').inner_text()
         self.assertIn("52条", platform_status)
-        self.assertIn("审批随所属整单", platform_status)
+        self.assertIn("52条", platform_status)
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
         self.assertIn("396条明细", self.page.locator('.cat-nav-item[data-cat="six"] .cat-status').inner_text())
         self.assertIn("484条明细", self.page.locator("#statsMeta").inner_text())
         self.assert_no_page_errors()
 
     def test_viewing_automatic_categories_does_not_mutate_local_state(self):
-        storage_key = "srdpm_approval_v2_2026-07"
+        storage_key = "srdpm_approval_v3_2026-07"
         self.assertIsNone(self.page.evaluate("key => localStorage.getItem(key)", storage_key))
         self.page.locator('.cat-nav-item[data-cat="five"]').click()
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
@@ -215,7 +216,7 @@ class DashboardUiTests(unittest.TestCase):
         first_action = self.page.locator("#panel_three tbody .btn-approve").first
         first_action.click()
         state = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
         )
         self.assertEqual(len(state), 1)
         key, value = next(iter(state.items()))
@@ -228,7 +229,7 @@ class DashboardUiTests(unittest.TestCase):
 
         self.page.locator("#panel_three tbody .btn-approve.done").first.click()
         state = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
         )
         self.assertEqual(state, {})
         self.assert_no_page_errors()
@@ -236,8 +237,8 @@ class DashboardUiTests(unittest.TestCase):
     def test_bulk_auto_selection_exports_unique_offline_plan(self):
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
         self.page.locator("button[onclick='selectAllAutoGroups()']").click()
-        self.assertIn("已选50", self.page.locator("#pendingCount").inner_text())
-        self.assertIn("50个人日/443条明细", self.page.locator("#btnConfirm").inner_text())
+        self.assertIn("已选448", self.page.locator("#pendingCount").inner_text())
+        self.assertIn("448条选择/448个待审ID", self.page.locator("#btnConfirm").inner_text())
 
         self.page.once("dialog", lambda dialog: dialog.accept())
         with self.page.expect_download() as download_info:
@@ -246,13 +247,12 @@ class DashboardUiTests(unittest.TestCase):
         self.assertEqual(download.suggested_filename, "srdpm-approval-plan-2026-07.json")
         parsed_plan = load_plan(Path(download.path()))
         parsed_summary = summarize_plan(parsed_plan)
-        self.assertEqual(parsed_summary.group_count, 50)
-        self.assertEqual(parsed_summary.id_count, 443)
         plan = self.page.evaluate("window.__lastApprovalPlan")
         self.assertEqual(plan["schema_version"], 1)
-        self.assertEqual(plan["summary"]["group_count"], 50)
-        self.assertEqual(plan["summary"]["item_count"], 443)
-        self.assertTrue(all(group["review_mode"] == "auto" for group in plan["groups"]))
+        self.assertEqual(plan["summary"]["selection_count"], 448)
+        self.assertEqual(plan["summary"]["item_count"], 448)
+        self.assertEqual(parsed_summary.group_count, plan["summary"]["group_count"])
+        self.assertEqual(parsed_summary.id_count, 448)
         ids = [approve_id for group in plan["groups"] for approve_id in group["approve_ids"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assert_no_page_errors()
@@ -268,7 +268,7 @@ class DashboardUiTests(unittest.TestCase):
 
         self.assertEqual(f"{parsed.scheme}://{parsed.netloc}", "http://127.0.0.1:8765")
         self.assertEqual(set(payload), {"version", "month", "group_keys"})
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], 2)
         self.assertEqual(payload["month"], "2026-07")
         self.assertEqual(len(payload["group_keys"]), 1)
         self.assertNotIn("approve_ids", json.dumps(payload))
@@ -307,7 +307,7 @@ class DashboardUiTests(unittest.TestCase):
         stale_json = json.dumps({stale["group_key"]: "selected"})
         self.context.add_init_script(
             script=f"""if (location.hostname === '127.0.0.1') {{
-                localStorage.setItem('srdpm_approval_v2_2026-07', {json.dumps(stale_json)});
+                localStorage.setItem('srdpm_approval_v3_2026-07', {json.dumps(stale_json)});
             }}"""
         )
 
@@ -320,7 +320,7 @@ class DashboardUiTests(unittest.TestCase):
 
         self.assertEqual(urlparse(self.page.url).fragment, "")
         state = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
         )
         self.assertEqual(state, {selected["group_key"]: "selected"})
         prepare = next(item for item in requests if item["path"] == "/api/v1/approval/prepare")
@@ -389,7 +389,7 @@ class DashboardUiTests(unittest.TestCase):
             {
                 "approval_selection": json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "month": "2026-07",
                         "group_keys": ["grp_ffffffffffffffffffff"],
                     }
@@ -401,7 +401,7 @@ class DashboardUiTests(unittest.TestCase):
         )
 
         self.assertEqual(urlparse(self.page.url).fragment, "")
-        self.assertIn("无法导入所选整单", self.page.locator("#approvalFeedback").inner_text())
+        self.assertIn("无法导入所选明细", self.page.locator("#approvalFeedback").inner_text())
         self.assertEqual(requests, [])
         self.assert_no_page_errors()
 
@@ -440,15 +440,15 @@ class DashboardUiTests(unittest.TestCase):
         )
 
         before = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
         )
-        self.assertEqual(len(before), 50)
+        self.assertEqual(len(before), 448)
         self.page.locator("#panel_five .btn-approve.done").first.click()
         after = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
         )
-        self.assertEqual(len(after), 49)
-        self.assertIn("已选49", self.page.locator("#pendingCount").inner_text())
+        self.assertEqual(len(after), 447)
+        self.assertIn("已选447", self.page.locator("#pendingCount").inner_text())
         self.assertEqual(
             self.page.locator(".cat-nav-item.active").get_attribute("data-cat"), "five"
         )
@@ -474,7 +474,7 @@ class DashboardUiTests(unittest.TestCase):
             self.page.locator(".cat-nav-item.active").get_attribute("data-cat"), "six"
         )
         self.assertIsNone(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")
+            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
         )
         self.assert_no_page_errors()
 
@@ -556,7 +556,7 @@ class DashboardUiTests(unittest.TestCase):
             self.page.evaluate("key => getGroupStatus(key)", group_key), "approved"
         )
         self.assertEqual(
-            json.loads(self.page.evaluate("localStorage.getItem('srdpm_approval_v2_2026-07')")),
+            json.loads(self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")),
             {},
         )
         self.assert_no_page_errors()

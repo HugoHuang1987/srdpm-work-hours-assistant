@@ -42,6 +42,10 @@ VERIFY_TLS = os.environ.get("SRDPM_VERIFY_TLS", "true").strip().lower() not in {
     "0", "false", "no", "off"
 }
 
+# 此脚本的职责严格限定为抓取与审计。尽管 SRDPM 的读取接口位于
+# ``workload/approve`` 路径下，也绝不能允许这里通过字符串拼接调用审批或驳回。
+READ_ONLY_API_PATHS = frozenset({"userList", "list", "statistics", "detail"})
+
 
 def get_month_range(year, month):
     """获取指定月份的日期范围"""
@@ -62,8 +66,15 @@ def month_display(year, month):
 
 
 # ========== Step 1: 登录获取凭证 ==========
-def login_srdpm():
-    if not USER or not PASS:
+def login_srdpm(username=None, password=None):
+    """创建只读抓取会话。
+
+    未传入参数时保留命令行环境变量的既有行为；后台刷新器可仅在内存中
+    从 Windows Credential Manager 传入凭据，避免把凭据写入环境变量。
+    """
+    username = USER if username is None else str(username).strip()
+    password = PASS if password is None else str(password)
+    if not username or not password:
         raise RuntimeError(
             "缺少 SRDPM 登录凭据。请先设置 SRDPM_USERNAME 和 SRDPM_PASSWORD 环境变量。"
         )
@@ -80,8 +91,8 @@ def login_srdpm():
         page.goto(URL, timeout=60000, wait_until="networkidle")
         page.wait_for_timeout(2000)
 
-        page.locator('input[name="username"]').fill(USER)
-        page.locator('input[name="password"]').fill(PASS)
+        page.locator('input[name="username"]').fill(username)
+        page.locator('input[name="password"]').fill(password)
         page.locator('button:has-text("登录")').click()
         page.wait_for_timeout(6000)
 
@@ -127,13 +138,18 @@ def login_srdpm():
 
 
 def api_call(session, path, payload):
+    if path not in READ_ONLY_API_PATHS:
+        raise ValueError(f"fetch_and_audit.py 只允许读取接口，拒绝调用: {path}")
     url = f"{BASE_API}/{path}"
     try:
         r = session.post(url, json=payload, timeout=30)
-        return r.json()
+        response = r.json()
     except Exception as e:
-        print(f"  API 调用失败 {path}: {e}")
-        return {'code': -1, 'msg': str(e)}
+        # 不把响应内容、cookie 或 token 写入错误信息；调用方必须停止本次刷新。
+        raise RuntimeError(f"只读接口 {path} 调用失败") from e
+    if not isinstance(response, dict) or response.get('code') != 200:
+        raise RuntimeError(f"只读接口 {path} 返回失败状态")
+    return response
 
 
 def dedupe_parent_records(records):
@@ -223,13 +239,14 @@ def fetch_month(session, year, month):
     print("[2] 获取用户列表...")
     last_day_str = f"{year}-{month}-{calendar.monthrange(year, month)[1]}"
     user_resp = api_call(session, 'userList', {"time": last_day_str, "group_id": None})
-    all_users = []
-    if user_resp.get('code') == 200 and user_resp.get('data'):
-        all_users = [{'uid': u['uid'], 'cn_name': u['cn_name']} for u in user_resp['data']]
-        print(f"  获取到 {len(all_users)} 人")
-    else:
-        print(f"  获取用户列表失败: {user_resp}")
-        return None
+    user_data = user_resp.get('data')
+    if not isinstance(user_data, list) or not user_data:
+        raise RuntimeError("只读接口 userList 返回空或结构异常")
+    try:
+        all_users = [{'uid': u['uid'], 'cn_name': u['cn_name']} for u in user_data]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("只读接口 userList 人员结构异常") from exc
+    print(f"  获取到 {len(all_users)} 人")
 
     # 循环获取每日数据
     print("[3] 循环获取每日数据...")
@@ -254,28 +271,36 @@ def fetch_month(session, year, month):
                     "group_id": None
                 }
                 resp = api_call(session, 'list', payload)
-                if resp.get('code') == 200 and resp.get('data'):
-                    data_list = resp['data'].get('data', [])
-                    if data_list:
-                        list_data.extend(data_list)
-                    total = resp['data'].get('total', 0)
-                    per_page = resp['data'].get('per_page', 50)
-                    if page_num * per_page >= total or not data_list:
-                        break
-                    page_num += 1
-                else:
+                response_data = resp.get('data')
+                if not isinstance(response_data, dict):
+                    raise RuntimeError(f"只读接口 list 返回结构异常（{date_str}）")
+                data_list = response_data.get('data', [])
+                if not isinstance(data_list, list):
+                    raise RuntimeError(f"只读接口 list 明细结构异常（{date_str}）")
+                if data_list:
+                    list_data.extend(data_list)
+                total = response_data.get('total', 0)
+                per_page = response_data.get('per_page', 50)
+                if not isinstance(total, int) or not isinstance(per_page, int) or per_page <= 0:
+                    raise RuntimeError(f"只读接口 list 分页结构异常（{date_str}）")
+                if page_num * per_page >= total or not data_list:
                     break
+                page_num += 1
 
         received_count = len(list_data)
         list_data = dedupe_parent_records(list_data)
 
         stats_resp = api_call(session, 'statistics', {"time": time_param})
         detail_resp = api_call(session, 'detail', {"time": time_param})
+        statistics_data = stats_resp.get('data')
+        detail_data = detail_resp.get('data')
+        if not isinstance(statistics_data, dict) or not isinstance(detail_data, dict):
+            raise RuntimeError(f"只读统计或明细接口返回结构异常（{date_str}）")
 
         daily_data[date_str] = {
             'list': list_data,
-            'statistics': stats_resp.get('data', {}),
-            'detail': detail_resp.get('data', {})
+            'statistics': statistics_data,
+            'detail': detail_data
         }
         total_days += 1
         unique_children = sum(len(parent.get("children", [])) for parent in list_data)

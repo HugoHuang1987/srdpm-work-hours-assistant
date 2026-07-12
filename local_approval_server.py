@@ -49,7 +49,6 @@ from approval_model import (
     assign_primary_categories,
     build_approval_groups,
     iter_unique_children,
-    make_group_key,
     manual_pairs_from_categories,
 )
 from build_multi_month_dashboard import build_category_data
@@ -89,10 +88,11 @@ class ServiceError(RuntimeError):
 class RebuiltPlan:
     plan: ApprovalPlan
     summary: PlanSummary
+    # Browser-facing keys identify exact category selections, not a whole day.
     group_keys: tuple[str, ...]
     group_rows: tuple[dict[str, Any], ...]
     identity_by_person_date: Mapping[tuple[str, str], tuple[str, str, str | None]]
-    group_key_by_identity: Mapping[tuple[str, str, str | None], str]
+    group_keys_by_identity: Mapping[tuple[str, str, str | None], tuple[str, ...]]
 
 
 @dataclass
@@ -116,34 +116,31 @@ def _short_display_text(value: Any, limit: int = 100) -> str:
 
 
 def _impact_summaries(raw_data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return display summaries keyed by an exact approval ID."""
+
     summaries: dict[str, dict[str, Any]] = {}
     for record in iter_unique_children(raw_data):
-        group_key = make_group_key(record["date"], record["person"])
-        summary = summaries.setdefault(
-            group_key,
-            {"work_hours": 0.0, "projects": [], "project_count": 0, "_project_seen": set()},
-        )
+        approve_id = str(record.get("approve_id") or "").strip()
+        if not approve_id:
+            continue
         child = record["child"]
         try:
             hours = float(child.get("work_hours", 0) or 0)
         except (TypeError, ValueError):
             hours = 0.0
-        if math.isfinite(hours):
-            summary["work_hours"] += hours
+        if not math.isfinite(hours):
+            hours = 0.0
         project = _short_display_text(
             child.get("items")
             or child.get("items_name")
             or child.get("project_name")
             or "未标注项目"
         )
-        if project and project not in summary["_project_seen"]:
-            summary["_project_seen"].add(project)
-            summary["project_count"] += 1
-            if len(summary["projects"]) < 10:
-                summary["projects"].append(project)
-    for summary in summaries.values():
-        summary["work_hours"] = round(summary["work_hours"], 2)
-        summary.pop("_project_seen", None)
+        summaries[approve_id] = {
+            "work_hours": round(hours, 2),
+            "projects": [project] if project else [],
+            "project_count": 1 if project else 0,
+        }
     return summaries
 
 
@@ -166,7 +163,7 @@ def confirm_approval_with_windows(summary: PlanSummary) -> bool:
     message = (
         "即将执行不可撤回的 SRDPM 真实审批。\n\n"
         f"月份：{summary.month}\n"
-        f"人员日期整单：{summary.group_count}\n"
+        f"执行人员日期批次：{summary.group_count}\n"
         f"待审 ID：{summary.id_count}\n"
         f"清单校验码：{verification_code}\n\n"
         "只有当你刚刚在 SRDPM 工时审批看板核对过相同校验码时，才点击“是”。\n"
@@ -197,14 +194,14 @@ def _read_json_file(path: Path, label: str, *, required: bool) -> Any:
 def rebuild_plan_from_archive(
     archive_root: Path, month: str, selected_group_keys: Sequence[str]
 ) -> RebuiltPlan:
-    """从当前归档重建白名单，并只从白名单生成不可变审批计划。"""
+    """从当前归档重建精确明细白名单，并生成不可变审批计划。"""
 
     if not isinstance(month, str) or not MONTH_PATTERN.fullmatch(month):
         raise ServiceError(400, "invalid_month", "month 必须为合法 YYYY-MM")
     if not isinstance(selected_group_keys, (list, tuple)):
         raise ServiceError(400, "invalid_group_keys", "group_keys 必须是数组")
     if not selected_group_keys:
-        raise ServiceError(400, "empty_selection", "至少选择一个人员日期整单")
+        raise ServiceError(400, "empty_selection", "至少选择一条审批明细")
     if len(selected_group_keys) > MAX_SELECTED_GROUPS:
         raise ServiceError(413, "too_many_groups", "选择整单数超过安全上限 200")
 
@@ -212,13 +209,15 @@ def rebuild_plan_from_archive(
     seen_keys: set[str] = set()
     for value in selected_group_keys:
         if not isinstance(value, str) or not GROUP_KEY_PATTERN.fullmatch(value):
-            raise ServiceError(400, "invalid_group_key", "group_keys 包含非法稳定整单 ID")
+            raise ServiceError(400, "invalid_group_key", "group_keys 包含非法稳定明细 ID")
         if value in seen_keys:
             raise ServiceError(400, "duplicate_group_key", "group_keys 不允许重复")
         seen_keys.add(value)
         normalized_keys.append(value)
 
     root = archive_root.resolve()
+    if (root.parent / ".srdpm-refresh.lock").exists():
+        raise ServiceError(409, "refresh_in_progress", "数据刷新进行中，请稍后重新打开看板")
     month_dir = (root / month).resolve()
     try:
         month_dir.relative_to(root)
@@ -240,7 +239,9 @@ def rebuild_plan_from_archive(
     try:
         categories = build_category_data(audit_data, md_text, raw_data)
         groups = build_approval_groups(
-            raw_data, manual_pairs_from_categories(categories)
+            raw_data,
+            manual_pairs_from_categories(categories),
+            categories=categories,
         )
         assign_primary_categories(categories, groups)
         impact_summaries = _impact_summaries(raw_data)
@@ -253,11 +254,11 @@ def rebuild_plan_from_archive(
     for group_key in normalized_keys:
         group = groups.get(group_key)
         if not isinstance(group, Mapping):
-            raise ServiceError(409, "group_not_allowed", "所选整单已不在当前归档白名单")
+            raise ServiceError(409, "group_not_allowed", "所选明细已不在当前归档白名单")
         if group.get("status") == "approved":
-            raise ServiceError(409, "group_already_approved", "所选整单在当前归档中已审批")
+            raise ServiceError(409, "group_already_approved", "所选明细在当前归档中已审批")
         if group.get("primary_category") not in ACTIONABLE_CATEGORIES:
-            raise ServiceError(409, "group_not_actionable", "所选整单不属于可审批分类")
+            raise ServiceError(409, "group_not_actionable", "所选明细不属于可审批分类")
         selected_groups.append((group_key, group))
 
     selected_groups.sort(
@@ -268,30 +269,71 @@ def rebuild_plan_from_archive(
         )
     )
 
-    plan_groups: list[dict[str, Any]] = []
+    # Multiple selected rows may belong to the same person-date.  They are
+    # merged only for the single SRDPM request; each browser-selected row stays
+    # independently visible in the confirmation and result payload.
+    plan_groups_by_identity: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    group_keys_by_identity: dict[tuple[str, str, str | None], list[str]] = {}
+    identity_by_person_date: dict[tuple[str, str], tuple[str, str, str | None]] = {}
+    id_owners: dict[str, tuple[str, str, str | None]] = {}
     group_rows: list[dict[str, Any]] = []
     total_ids = 0
     for group_key, group in selected_groups:
-        approve_ids = list(group.get("approve_ids") or [])
+        approve_ids = [str(value) for value in group.get("approve_ids") or []]
         if not approve_ids:
-            raise ServiceError(409, "group_without_ids", "所选整单没有可执行审批 ID")
+            raise ServiceError(409, "group_without_ids", "所选明细没有可执行审批 ID")
         if len(approve_ids) > MAX_IDS_PER_GROUP:
-            raise ServiceError(413, "group_too_large", "单个人员日期整单超过 500 个审批 ID")
-        total_ids += len(approve_ids)
-        if total_ids > MAX_TOTAL_IDS:
-            raise ServiceError(413, "plan_too_large", "审批计划超过 5000 个审批 ID")
+            raise ServiceError(413, "group_too_large", "单条选择超过 500 个审批 ID")
 
         date = str(group.get("date") or "")
         person = str(group.get("person") or "").strip()
-        plan_group: dict[str, Any] = {
-            "person": person,
-            "date": date,
-            "approve_ids": approve_ids,
-        }
-        user_id = group.get("user_id")
-        if user_id is not None and str(user_id).strip():
-            plan_group["user_id"] = str(user_id).strip()
-        plan_groups.append(plan_group)
+        raw_user_id = group.get("user_id")
+        user_id = str(raw_user_id).strip() if raw_user_id is not None else None
+        user_id = user_id or None
+        identity = (person, date, user_id)
+        person_date = (person, date)
+        existing_identity = identity_by_person_date.get(person_date)
+        if existing_identity is not None and existing_identity != identity:
+            raise ServiceError(409, "ambiguous_person_identity", "同名人员身份不一致，已停止审批")
+        identity_by_person_date[person_date] = identity
+
+        plan_group = plan_groups_by_identity.setdefault(
+            identity,
+            {"person": person, "date": date, "approve_ids": []},
+        )
+        if user_id is not None:
+            plan_group["user_id"] = user_id
+        for approve_id in approve_ids:
+            owner = id_owners.get(approve_id)
+            if owner is not None and owner != identity:
+                raise ServiceError(409, "approval_id_identity_conflict", "审批明细身份冲突")
+            if owner is None:
+                id_owners[approve_id] = identity
+                plan_group["approve_ids"].append(approve_id)
+                total_ids += 1
+        if total_ids > MAX_TOTAL_IDS:
+            raise ServiceError(413, "plan_too_large", "审批计划超过 5000 个审批 ID")
+        group_keys_by_identity.setdefault(identity, []).append(group_key)
+
+        projects: list[str] = []
+        project_seen: set[str] = set()
+        work_hours = 0.0
+        for approve_id in approve_ids:
+            impact = impact_summaries.get(approve_id, {})
+            try:
+                work_hours += float(impact.get("work_hours", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            for project in impact.get("projects", []):
+                if project not in project_seen:
+                    project_seen.add(project)
+                    projects.append(project)
+        source_categories = group.get("source_categories") or []
+        category_titles = [
+            _short_display_text(categories.get(key, {}).get("title"))
+            for key in source_categories
+            if key in categories
+        ]
         group_rows.append(
             {
                 "group_key": group_key,
@@ -299,43 +341,38 @@ def rebuild_plan_from_archive(
                 "person": person,
                 "id_count": len(approve_ids),
                 "item_count": int(group.get("item_count") or len(approve_ids)),
-                "work_hours": impact_summaries.get(group_key, {}).get("work_hours", 0),
-                "projects": impact_summaries.get(group_key, {}).get("projects", []),
-                "project_count": impact_summaries.get(group_key, {}).get("project_count", 0),
-                "review_summary": _short_display_text(
-                    categories.get(group.get("primary_category"), {}).get("title")
-                    or ("人工异常" if group.get("review_mode") == "manual" else "自动候选")
-                ),
+                "work_hours": round(work_hours, 2),
+                "projects": projects[:10],
+                "project_count": len(projects),
+                "review_summary": " / ".join(category_titles)
+                or ("人工异常" if group.get("review_mode") == "manual" else "自动候选"),
                 "review_mode": "manual"
                 if group.get("review_mode") == "manual"
                 else "auto",
+                "scope": str(group.get("scope") or "明细"),
             }
         )
 
     try:
         plan = parse_plan(
-            {"schema_version": 1, "month": month, "groups": plan_groups}
+            {
+                "schema_version": 1,
+                "month": month,
+                "groups": list(plan_groups_by_identity.values()),
+            }
         )
     except PlanValidationError as exc:
         raise ServiceError(409, "rebuilt_plan_invalid", "当前归档无法生成安全审批计划") from exc
     summary = summarize_plan(plan)
-    identity_by_person_date: dict[
-        tuple[str, str], tuple[str, str, str | None]
-    ] = {}
-    group_key_by_identity: dict[tuple[str, str, str | None], str] = {}
-    for group_key, group in zip(
-        (row["group_key"] for row in group_rows), plan.groups, strict=True
-    ):
-        identity = (group.person, group.date, group.user_id)
-        identity_by_person_date[(group.person, group.date)] = identity
-        group_key_by_identity[identity] = group_key
     return RebuiltPlan(
         plan=plan,
         summary=summary,
         group_keys=tuple(row["group_key"] for row in group_rows),
         group_rows=tuple(group_rows),
         identity_by_person_date=identity_by_person_date,
-        group_key_by_identity=group_key_by_identity,
+        group_keys_by_identity={
+            identity: tuple(keys) for identity, keys in group_keys_by_identity.items()
+        },
     )
 
 
@@ -462,6 +499,7 @@ class ApprovalService:
             "summary": {
                 "month": rebuilt.summary.month,
                 "group_count": rebuilt.summary.group_count,
+                "selection_count": len(rebuilt.group_rows),
                 "id_count": rebuilt.summary.id_count,
                 "person_count": rebuilt.summary.person_count,
                 "date_count": rebuilt.summary.date_count,
@@ -601,43 +639,41 @@ class ApprovalService:
                     job["message"] = "SRDPM 登录配置不可用，未联网、未提交审批"
                     job["finished_at"] = _utc_now_text()
                 return
-            report = execute_plan(rebuilt.plan, client)
+            report = execute_plan(rebuilt.plan, client, allow_partial=True)
 
             rows_by_key = {row["group_key"]: row for row in group_results}
-            # 结果本身不携带浏览器字段。先在服务端重建的 ApprovalPlan 中恢复
-            # 含 user_id 的完整身份，再映射到稳定 group_key；不会按结果数组下标
-            # 猜测，因为全量预检失败时结果可能只包含中间某一组。
+            # 结果本身不携带浏览器字段。服务端按完整人员身份把执行批次
+            # 映射回所有精确明细选择；不会按结果数组下标猜测。
             for result in report.group_results:
                 identity = rebuilt.identity_by_person_date.get(
                     (result.person, result.date)
                 )
-                group_key = (
-                    rebuilt.group_key_by_identity.get(identity)
+                group_keys = (
+                    rebuilt.group_keys_by_identity.get(identity, ())
                     if identity is not None
-                    else None
+                    else ()
                 )
-                if group_key is None:
+                if not group_keys:
                     continue
-                row = rows_by_key[group_key]
-                verification_status = result.verification_status
-                if verification_status == "verified_approved":
-                    row["state"] = "verified_approved"
-                    row["message"] = "SRDPM 回读状态全部为通过"
-                elif verification_status == "unknown":
-                    row["state"] = "unknown"
-                    row["message"] = "审批最终状态需人工核对"
-                else:
-                    row["state"] = "not_attempted"
-                    row["message"] = (
-                        "提交前校验失败，未尝试审批"
-                    )
+                for group_key in group_keys:
+                    row = rows_by_key[group_key]
+                    verification_status = result.verification_status
+                    if verification_status == "verified_approved":
+                        row["state"] = "verified_approved"
+                        row["message"] = "SRDPM 回读状态全部为通过"
+                    elif verification_status == "unknown":
+                        row["state"] = "unknown"
+                        row["message"] = "审批最终状态需人工核对"
+                    else:
+                        row["state"] = "not_attempted"
+                        row["message"] = "提交前校验失败，未尝试审批"
 
             if report.success:
                 final_status = "succeeded"
-                message = "全部整单审批并经 SRDPM 回读确认通过"
+                message = "全部所选明细审批并经 SRDPM 回读确认通过"
             elif report.outcome == "partial_success":
                 final_status = "failed"
-                message = "部分整单已确认通过，其余整单未执行或状态未知"
+                message = "部分所选明细已确认通过，其余明细未执行或状态未知"
             elif report.outcome == "state_unknown":
                 final_status = "failed"
                 message = "审批结果存在未知状态，请在 SRDPM 中人工核对"

@@ -406,13 +406,28 @@ def _remote_id_set(values: Sequence[str], label: str) -> set[str]:
     return result
 
 
-def _drift_message(planned: set[str], actual: set[str]) -> str:
+def _drift_message(
+    planned: set[str], actual: set[str], *, allow_partial: bool = False
+) -> str:
     missing = sorted(planned - actual, key=_id_sort_key)
     unexpected = sorted(actual - planned, key=_id_sort_key)
+    if allow_partial:
+        return (
+            "所选审批 ID 已不再全部处于待审状态，已拒绝执行："
+            f"缺失={missing}"
+        )
     return (
         "实时待审 ID 与计划不一致，已拒绝执行："
         f"缺失={missing}，计划外={unexpected}"
     )
+
+
+def _pending_ids_match_plan(
+    planned: set[str], actual: set[str], *, allow_partial: bool
+) -> bool:
+    """Strict CLI plans must equal a person-day; service selections may be subsets."""
+
+    return planned.issubset(actual) if allow_partial else actual == planned
 
 
 def _group_result(
@@ -475,7 +490,7 @@ def _failed_readback_ids(
 
 
 def _execute_plan_with_lock_held(
-    plan: ApprovalPlan, client: ApprovalClient
+    plan: ApprovalPlan, client: ApprovalClient, *, allow_partial: bool = False
 ) -> ExecutionReport:
     """逐组执行审批；任何漂移、API 异常或回读异常都停止后续提交。"""
 
@@ -503,8 +518,10 @@ def _execute_plan_with_lock_held(
                 )
             )
             return _stopped_report(results, message)
-        if actual != planned:
-            message = _drift_message(planned, actual)
+        if not _pending_ids_match_plan(
+            planned, actual, allow_partial=allow_partial
+        ):
+            message = _drift_message(planned, actual, allow_partial=allow_partial)
             results.append(
                 _group_result(
                     group,
@@ -541,8 +558,10 @@ def _execute_plan_with_lock_held(
             )
             return _stopped_report(results, message)
 
-        if actual != planned:
-            message = _drift_message(planned, actual)
+        if not _pending_ids_match_plan(
+            planned, actual, allow_partial=allow_partial
+        ):
+            message = _drift_message(planned, actual, allow_partial=allow_partial)
             results.append(
                 _group_result(
                     group,
@@ -675,8 +694,15 @@ def _execute_plan_with_lock_held(
     )
 
 
-def execute_plan(plan: ApprovalPlan, client: ApprovalClient) -> ExecutionReport:
-    """在共享执行锁保护下执行计划；锁忙时不访问客户端。"""
+def execute_plan(
+    plan: ApprovalPlan, client: ApprovalClient, *, allow_partial: bool = False
+) -> ExecutionReport:
+    """在共享执行锁保护下执行计划；锁忙时不访问客户端。
+
+    ``allow_partial`` is reserved for the local service after it has rebuilt an
+    exact category-row whitelist.  Standalone plans keep the original strict
+    person-day equality requirement.
+    """
 
     try:
         execution_lock = _try_acquire_execution_lock()
@@ -700,7 +726,9 @@ def execute_plan(plan: ApprovalPlan, client: ApprovalClient) -> ExecutionReport:
         )
 
     try:
-        return _execute_plan_with_lock_held(plan, client)
+        return _execute_plan_with_lock_held(
+            plan, client, allow_partial=allow_partial
+        )
     finally:
         execution_lock.release()
 

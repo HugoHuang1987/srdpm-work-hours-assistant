@@ -172,9 +172,9 @@ class LocalApprovalServerTests(unittest.TestCase):
         }
         self._write_raw()
 
-        self.group_a = make_group_key("2026-07-08", "测试人员A")
-        self.group_b = make_group_key("2026-07-09", "测试人员B")
-        self.group_c = make_group_key("2026-07-10", "测试人员C")
+        self.group_a = make_group_key("2026-07-08", "测试人员A", ["1001"])
+        self.group_b = make_group_key("2026-07-09", "测试人员B", ["2001"])
+        self.group_c = make_group_key("2026-07-10", "测试人员C", ["3001"])
         self.clock = FakeClock()
         self.credential_store = FakeCredentialStore()
         self.credential_validation_inputs: list[tuple[str, str]] = []
@@ -462,14 +462,55 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertEqual("invalid_request", body["error"]["code"])
 
         prepared = self._prepare([self.group_a])
-        self.assertEqual(2, prepared["summary"]["id_count"])
+        self.assertEqual(1, prepared["summary"]["id_count"])
+        self.assertEqual(1, prepared["summary"]["selection_count"])
         self.assertEqual("测试人员A", prepared["groups"][0]["person"])
-        self.assertEqual(2, prepared["groups"][0]["item_count"])
-        self.assertEqual(8.0, prepared["groups"][0]["work_hours"])
+        self.assertEqual(1, prepared["groups"][0]["item_count"])
+        self.assertEqual(4.0, prepared["groups"][0]["work_hours"])
         self.assertEqual(["G/TEST"], prepared["groups"][0]["projects"])
         self.assertEqual(1, prepared["groups"][0]["project_count"])
         self.assertTrue(prepared["groups"][0]["review_summary"])
         self.assertEqual([], self.clients)
+
+    def test_exact_selection_submits_only_its_id_when_same_day_has_other_pending_ids(self) -> None:
+        """A selected row must not expand to every pending item on that day."""
+
+        prepared = self._prepare([self.group_a])
+        self.assertEqual(1, prepared["summary"]["id_count"])
+        self.assertEqual(1, prepared["summary"]["selection_count"])
+        status, body = self._execute(prepared["ticket"])
+        self.assertEqual(202, status)
+        job = self._wait_job(body["job"]["job_id"])
+
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual([("1001",)], self.clients[0].approve_calls)
+        self.assertNotIn("1002", self.clients[0].approve_calls[0])
+
+    def test_project_mismatch_row_never_expands_to_same_day_normal_rows(self) -> None:
+        audit = _minimal_audit()
+        audit["project_mismatch"] = [
+            {
+                "date": "2026-07-08",
+                "person": "测试人员A",
+                "items": "G/TEST",
+                "title": "A1",
+                "content": "离线测试内容",
+                "work_hours": 4,
+                "allowed_chips": [],
+                "reason": "fixture project mismatch",
+            }
+        ]
+        (self.month_dir / "audit_report.json").write_text(
+            json.dumps(audit, ensure_ascii=False), encoding="utf-8"
+        )
+
+        prepared = self._prepare([self.group_a])
+        self.assertEqual("manual", prepared["groups"][0]["review_mode"])
+        self.assertEqual(1, prepared["groups"][0]["id_count"])
+        status, body = self._execute(prepared["ticket"])
+        self.assertEqual(202, status)
+        self._wait_job(body["job"]["job_id"])
+        self.assertEqual([("1001",)], self.clients[0].approve_calls)
 
     def test_ticket_expiration_and_reuse_never_duplicate_execution(self) -> None:
         expired = self._prepare([self.group_a])
@@ -569,7 +610,7 @@ class LocalApprovalServerTests(unittest.TestCase):
     def test_drift_is_not_attempted_and_stops_every_submission(self) -> None:
         self.client_builder = lambda: FakeClient(
             pending={
-                ("测试人员A", "2026-07-08"): ["1001", "9999"],
+                ("测试人员A", "2026-07-08"): ["9999"],
                 ("测试人员B", "2026-07-09"): ["2001"],
             },
             approved={},
@@ -611,16 +652,13 @@ class LocalApprovalServerTests(unittest.TestCase):
 
     def test_archive_change_after_prepare_fails_before_client_creation(self) -> None:
         prepared = self._prepare([self.group_a])
-        self.raw_data["daily_data"]["2026-07-08"]["list"][0]["children"].append(
-            _child("1003", "A3")
-        )
+        self.raw_data["daily_data"]["2026-07-08"]["list"][0]["children"][0][
+            "approve_id"
+        ] = "1003"
         self._write_raw()
         status, body = self._execute(prepared["ticket"])
         self.assertEqual(409, status)
-        self.assertEqual(
-            "archive_changed_before_confirmation", body["error"]["code"]
-        )
-        self.assertIn("归档在清单确认前发生变化", body["error"]["message"])
+        self.assertEqual("group_not_allowed", body["error"]["code"])
         self.assertEqual([], self.native_confirmation_summaries)
         self.assertEqual([], self.clients)
 
@@ -645,6 +683,22 @@ class LocalApprovalServerTests(unittest.TestCase):
             rebuild_plan_from_archive(self.archive, "2026-07", keys)
         self.assertEqual(413, context.exception.status)
         self.assertEqual("too_many_groups", context.exception.code)
+
+    def test_prepare_is_rejected_while_refresh_lock_is_present(self) -> None:
+        lock_path = self.root / ".srdpm-refresh.lock"
+        lock_path.write_text('{"schema_version":1}', encoding="utf-8")
+        try:
+            status, _, body = self._request(
+                "POST",
+                "/api/v1/approval/prepare",
+                {"month": "2026-07", "group_keys": [self.group_a]},
+            )
+        finally:
+            lock_path.unlink(missing_ok=True)
+
+        self.assertEqual(409, status)
+        self.assertEqual("refresh_in_progress", body["error"]["code"])
+        self.assertEqual([], self.clients)
 
 
 if __name__ == "__main__":

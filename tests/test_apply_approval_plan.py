@@ -344,6 +344,32 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
             )
             self.assertTrue(self.execution_locks[-1].released)
 
+    def test_exact_service_selection_allows_other_same_day_ids_but_submits_only_selected_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(
+                self.write_plan(
+                    directory,
+                    [
+                        {
+                            "person": "测试人员A",
+                            "date": "2026-07-08",
+                            "approve_ids": ["1001"],
+                        }
+                    ],
+                )
+            )
+            group_key = ("测试人员A", "2026-07-08")
+            fake = FakeClient(
+                pending={group_key: ["1001", "1002"]},
+                approved={group_key: {"1001": "通过"}},
+            )
+
+            report = execute_plan(plan, fake, allow_partial=True)
+
+            self.assertTrue(report.success)
+            self.assertEqual([("1001",)], fake.approve_calls)
+            self.assertEqual(VERIFICATION_VERIFIED_APPROVED, report.group_results[0].verification_status)
+
     def test_success_requires_second_pending_check_and_approved_readback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             plan = load_plan(self.write_plan(directory))
