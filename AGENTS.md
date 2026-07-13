@@ -46,7 +46,7 @@
 - `file://` 页面只能通过顶层导航把 `month + group_keys` 放入 localhost URL fragment；后台服务消费后必须立即清除 fragment，并以转交选择完整替换 localhost 旧选择。凭据不得进入 URL、storage、HTML、日志或反馈。
 - 提交调用抛异常时必须先只读回查，不能自动重提；只有逐 ID 回读为“通过”才能标记成功，其余必须区分 `not_attempted` 与 `unknown`。
 - 后台常驻服务的 execute 不能只信任浏览器确认；服务端必须在创建任务前显示 Windows 原生安全确认，默认选择“否”，并同时展示与网页清单一致的摘要哈希前缀。取消、弹窗不可用或摘要漂移都必须在创建客户端前停止。
-- 每周一 09:00 计划任务只能调用 `refresh_dashboard.py` 进行只读抓取、审计和页面刷新；不得调用审批、驳回、`apply_approval_plan.py` 或任何 `--execute`。刷新应使用 Credential Manager、暂存发布、刷新锁和失败保持旧页面。
+- 每周一 10:00 计划任务只能调用 `refresh_dashboard.py` 进行只读抓取、审计和页面刷新；不得调用审批、驳回、`apply_approval_plan.py` 或任何 `--execute`。刷新应使用 Credential Manager、暂存发布、刷新锁和失败保持旧页面。
 - 页面“重新读取当前月数据”也只能经同源本机服务调用固定的 `refresh_dashboard.refresh_current_month(project_dir=...)`；接口只接受精确空 JSON `{}`，不得接收页面提供的月份、路径、凭据、审批 ID 或脚本名。刷新期间必须拒绝新的 prepare/execute，成功后清除刷新月份的旧浏览器选择并重载页面；`file://` 页面不得用 URL fragment 自动触发带凭据刷新。
 
 ## 统计与状态语义

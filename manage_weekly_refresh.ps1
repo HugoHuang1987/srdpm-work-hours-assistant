@@ -5,7 +5,7 @@ param(
     [string]$Action = "Status"
 )
 
-# 管理“每周一 09:00 只刷新、不审批”的当前用户计划任务。
+# 管理“每周一 10:00 只刷新、不审批”的当前用户计划任务。
 # 安装本身只写入 Task Scheduler 配置，绝不立即联网或触发刷新。
 $ErrorActionPreference = "Stop"
 $taskName = "SRDPM-WeeklyDashboardRefresh"
@@ -74,7 +74,7 @@ function New-WeeklyRefreshDefinition {
     $trigger = New-ScheduledTaskTrigger `
         -Weekly `
         -DaysOfWeek Monday `
-        -At ([DateTime]::Today.AddHours(9))
+        -At ([DateTime]::Today.AddHours(10))
     $settings = New-ScheduledTaskSettingsSet `
         -StartWhenAvailable `
         -AllowStartIfOnBatteries `
@@ -100,7 +100,7 @@ function Show-WeeklyRefreshStatus {
         [PSCustomObject]@{
             Installed          = $false
             TaskName           = $taskName
-            Schedule           = "Monday 09:00"
+            Schedule           = "Monday 10:00"
             ApprovalOperations = "none"
         }
         return
@@ -116,7 +116,7 @@ function Show-WeeklyRefreshStatus {
         RunAs              = [string]$task.Principal.UserId
         LogonType          = [string]$task.Principal.LogonType
         RunLevel           = [string]$task.Principal.RunLevel
-        Schedule           = "Monday 09:00"
+        Schedule           = "Monday 10:00"
         TriggerStart       = [string]$taskTrigger.StartBoundary
         StartWhenAvailable = [bool]$task.Settings.StartWhenAvailable
         # Task Scheduler stores these two switches as inverse properties.
@@ -143,9 +143,9 @@ switch ($Action) {
             -Trigger $definition.Trigger `
             -Settings $definition.Settings `
             -Principal $definition.Principal `
-            -Description "每周一 09:00 仅拉取当前月 SRDPM 数据并刷新本地工时看板；不执行审批。" `
+            -Description "每周一 10:00 仅拉取当前月 SRDPM 数据并刷新本地工时看板；不执行审批。" `
             -Force | Out-Null
-        Write-Output "已安装当前用户周一 09:00 刷新任务；安装未触发网络访问。"
+        Write-Output "已安装当前用户周一 10:00 刷新任务；安装未触发网络访问。"
     }
     "Uninstall" {
         if ($null -ne (Get-ExistingTask)) {

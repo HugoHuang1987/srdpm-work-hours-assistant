@@ -365,7 +365,7 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertIn("New-ScheduledTaskTrigger", script)
         self.assertIn("-Weekly", script)
         self.assertIn("Monday", script)
-        self.assertIn("AddHours(9)", script)
+        self.assertIn("AddHours(10)", script)
         self.assertIn("-LogonType Interactive", script)
         self.assertIn("-RunLevel Limited", script)
         self.assertIn("Limited 表示最低权限", script)
