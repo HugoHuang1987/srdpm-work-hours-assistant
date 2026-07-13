@@ -2007,7 +2007,7 @@ async function refreshDashboardData() {
     }
 }
 
-function applyApprovalJobResult(job, executionMonth) {
+async function applyApprovalJobResult(job, executionMonth) {
     if (currentMonth !== executionMonth) {
         setApprovalFeedback("error", "审批已返回，但页面月份已改变。请重新打开本月看板核对，勿重复审批。");
         return;
@@ -2028,6 +2028,9 @@ function applyApprovalJobResult(job, executionMonth) {
     const details = unknownRows.slice(0, 5).map(row => `${row.date} ${row.person}`).join("、");
     if (job.outcome === "succeeded") {
         setApprovalFeedback("success", `审批完成：${verifiedRows.length}条所选明细已由 SRDPM 回读确认通过。\n本页已更新；下次重新打开前请重新拉取本月数据，以同步本地归档。`);
+        // 审批后的 SRDPM 状态已回读确认，但静态看板文件仍是审批前快照。
+        // 自动执行一次只读刷新，确保整页刷新也读取最新归档。
+        await refreshDashboardData();
     } else if (job.outcome === "partial_success") {
         setApprovalFeedback("warning", `部分完成：${verifiedRows.length}条明细已确认通过；${unknownRows.length}条状态未知；${notAttemptedRows.length}条未尝试。${details ? `\n状态未知：${details}${unknownRows.length > 5 ? "……" : ""}` : ""}\n请人工核对未成功明细，勿直接重复点击；重新打开前请先同步本月归档。`);
     } else if (job.outcome === "state_unknown") {
@@ -2092,7 +2095,7 @@ async function executeSelectedApprovals() {
         if (!jobId) throw new Error("本机审批服务没有返回任务编号");
         jobStarted = true;
         const job = await pollApprovalJob(jobId);
-        applyApprovalJobResult(job, executionMonth);
+        await applyApprovalJobResult(job, executionMonth);
     } catch (error) {
         const outcomeMayBeUnknown = jobStarted ||
             (executeRequestStarted && error.responseReceived !== true);
