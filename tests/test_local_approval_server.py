@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 from unittest.mock import patch
 
@@ -182,6 +183,11 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.native_confirmation_summaries: list[Any] = []
         self.clients: list[FakeClient] = []
         self.client_builder = self._success_client
+        self.refresh_calls: list[Path] = []
+        self.refresh_started = threading.Event()
+        self.release_refresh = threading.Event()
+        self.release_refresh.set()
+        self.refresh_error: Exception | None = None
 
         def factory() -> FakeClient:
             client = self.client_builder()
@@ -198,6 +204,15 @@ class LocalApprovalServerTests(unittest.TestCase):
             self.native_confirmation_summaries.append(summary)
             return True
 
+        def refresh_runner(project_dir: Path) -> SimpleNamespace:
+            self.refresh_calls.append(Path(project_dir))
+            self.refresh_started.set()
+            if not self.release_refresh.wait(timeout=3):
+                raise RuntimeError("offline refresh runner timed out")
+            if self.refresh_error is not None:
+                raise self.refresh_error
+            return SimpleNamespace(month="2026-07")
+
         self.server = create_server(
             port=0,
             project_dir=self.root,
@@ -206,12 +221,14 @@ class LocalApprovalServerTests(unittest.TestCase):
             credential_store=self.credential_store,
             credential_client_factory=credential_factory,
             approval_confirmer=approval_confirmer,
+            refresh_runner=refresh_runner,
             monotonic=self.clock,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
     def tearDown(self) -> None:
+        self.release_refresh.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -292,6 +309,23 @@ class LocalApprovalServerTests(unittest.TestCase):
             "POST", "/api/v1/approval/execute", {"ticket": ticket}
         )
         return status, body
+
+    def _start_refresh(self) -> tuple[int, Any]:
+        status, _, body = self._request("POST", "/api/v1/dashboard/refresh", {})
+        return status, body
+
+    def _wait_refresh_job(self, job_id: str) -> dict[str, Any]:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status, _, body = self._request(
+                "GET", f"/api/v1/dashboard/refresh/jobs/{job_id}"
+            )
+            self.assertEqual(200, status, body)
+            job = body["job"]
+            if job["status"] in {"succeeded", "failed"}:
+                return job
+            time.sleep(0.01)
+        self.fail("本机数据刷新任务没有在离线测试时限内完成")
 
     def _wait_job(self, job_id: str) -> dict[str, Any]:
         deadline = time.monotonic() + 3
@@ -698,6 +732,86 @@ class LocalApprovalServerTests(unittest.TestCase):
 
         self.assertEqual(409, status)
         self.assertEqual("refresh_in_progress", body["error"]["code"])
+        self.assertEqual([], self.clients)
+
+    def test_dashboard_refresh_is_pollable_read_only_job(self) -> None:
+        status, body = self._start_refresh()
+
+        self.assertEqual(202, status, body)
+        job_id = body["job"]["job_id"]
+        job = self._wait_refresh_job(job_id)
+        self.assertEqual("succeeded", job["status"])
+        self.assertEqual("2026-07", job["updated_month"])
+        self.assertEqual([self.root], self.refresh_calls)
+        self.assertEqual([], self.clients)
+        self.assertEqual([], self.native_confirmation_summaries)
+        self.assertEqual([], self.credential_validation_inputs)
+
+    def test_dashboard_refresh_requires_exact_empty_body_and_same_origin(self) -> None:
+        status, _, body = self._request(
+            "POST", "/api/v1/dashboard/refresh", {"month": "2026-07"}
+        )
+        self.assertEqual(400, status, body)
+        self.assertEqual("invalid_request", body["error"]["code"])
+
+        status, _, body = self._request(
+            "POST",
+            "/api/v1/dashboard/refresh",
+            {},
+            headers={"Origin": "http://evil.example"},
+        )
+        self.assertEqual(403, status, body)
+        self.assertEqual("invalid_origin", body["error"]["code"])
+        self.assertEqual([], self.refresh_calls)
+
+    def test_dashboard_refresh_blocks_new_or_prepared_approval_execution(self) -> None:
+        prepared = self._prepare([self.group_a])
+        self.release_refresh.clear()
+        try:
+            status, body = self._start_refresh()
+            self.assertEqual(202, status, body)
+            self.assertTrue(self.refresh_started.wait(timeout=1))
+
+            status, _, body = self._request("POST", "/api/v1/dashboard/refresh", {})
+            self.assertEqual(409, status, body)
+            self.assertEqual("refresh_busy", body["error"]["code"])
+
+            status, _, body = self._request(
+                "POST",
+                "/api/v1/approval/prepare",
+                {"month": "2026-07", "group_keys": [self.group_a]},
+            )
+            self.assertEqual(409, status, body)
+            self.assertEqual("refresh_in_progress", body["error"]["code"])
+
+            status, body = self._execute(prepared["ticket"])
+            self.assertEqual(409, status, body)
+            self.assertEqual("refresh_in_progress", body["error"]["code"])
+            self.assertEqual([], self.clients)
+        finally:
+            self.release_refresh.set()
+
+    def test_dashboard_refresh_is_rejected_while_approval_execution_is_reserved(self) -> None:
+        self.assertTrue(self.server.service._execution_lock.acquire(blocking=False))
+        try:
+            status, body = self._start_refresh()
+        finally:
+            self.server.service._execution_lock.release()
+
+        self.assertEqual(409, status, body)
+        self.assertEqual("approval_in_progress", body["error"]["code"])
+        self.assertEqual([], self.refresh_calls)
+
+    def test_dashboard_refresh_failure_does_not_echo_internal_error(self) -> None:
+        internal_error = "offline-refresh-internal-detail"
+        self.refresh_error = RuntimeError(internal_error)
+        status, body = self._start_refresh()
+
+        self.assertEqual(202, status, body)
+        job = self._wait_refresh_job(body["job"]["job_id"])
+        self.assertEqual("failed", job["status"])
+        self.assertIn("数据刷新失败", job["message"])
+        self.assertNotIn(internal_error, job["message"])
         self.assertEqual([], self.clients)
 
 

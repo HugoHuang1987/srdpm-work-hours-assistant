@@ -62,6 +62,9 @@ SERVICE_BUILD_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 GROUP_KEY_PATTERN = re.compile(r"^grp_[0-9a-f]{20}$")
 JOB_PATH_PATTERN = re.compile(r"^/api/v1/approval/jobs/([A-Za-z0-9_-]{20,100})$")
+REFRESH_JOB_PATH_PATTERN = re.compile(
+    r"^/api/v1/dashboard/refresh/jobs/([A-Za-z0-9_-]{20,100})$"
+)
 
 LISTEN_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -388,6 +391,7 @@ class ApprovalService:
         credential_store: Any | None = None,
         credential_client_factory: Callable[[str, str], Any] = SRDPMClient.from_credentials,
         approval_confirmer: Callable[[PlanSummary], bool] = confirm_approval_with_windows,
+        refresh_runner: Callable[[Path], Any] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
@@ -401,11 +405,14 @@ class ApprovalService:
         self.credential_client_factory = credential_client_factory
         self.approval_confirmer = approval_confirmer
         self.client_factory = client_factory or self._client_from_configured_credentials
+        self.refresh_runner = refresh_runner or self._refresh_current_month
         self.monotonic = monotonic
         self.instance_id = secrets.token_urlsafe(18)
         self.csrf_token = secrets.token_urlsafe(32)
         self._tickets: dict[str, PreparedTicket] = {}
         self._jobs: dict[str, dict[str, Any]] = {}
+        self._refresh_jobs: dict[str, dict[str, Any]] = {}
+        self._refresh_active = False
         self._state_lock = threading.RLock()
         self._execution_lock = threading.Lock()
 
@@ -474,10 +481,32 @@ class ApprovalService:
             )
         return SRDPMClient.from_env()
 
+    def _refresh_current_month(self, project_dir: Path) -> Any:
+        """Run the only supported read-only refresh entrypoint lazily.
+
+        Importing here keeps ordinary dashboard/approval startup free from the
+        refresh module while ensuring that a UI request cannot choose a script,
+        month, path, credential, or approval operation.
+        """
+
+        from refresh_dashboard import refresh_current_month
+
+        return refresh_current_month(project_dir=project_dir)
+
+    def _raise_if_refresh_active_locked(self) -> None:
+        if self._refresh_active:
+            raise ServiceError(
+                409,
+                "refresh_in_progress",
+                "数据刷新进行中，请等待页面重新加载后再审批",
+            )
+
     def rebuild(self, month: str, group_keys: Sequence[str]) -> RebuiltPlan:
         return rebuild_plan_from_archive(self.archive_root, month, group_keys)
 
     def prepare(self, month: str, group_keys: Sequence[str]) -> dict[str, Any]:
+        with self._state_lock:
+            self._raise_if_refresh_active_locked()
         rebuilt = self.rebuild(month, group_keys)
         token = secrets.token_urlsafe(32)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=TICKET_TTL_SECONDS)
@@ -520,6 +549,7 @@ class ApprovalService:
             raise ServiceError(400, "invalid_ticket", "ticket 必须是非空字符串")
 
         with self._state_lock:
+            self._raise_if_refresh_active_locked()
             ticket = self._tickets.get(ticket_token)
             if ticket is None:
                 raise ServiceError(409, "ticket_invalid", "审批票据不存在或已经失效")
@@ -595,6 +625,110 @@ class ApprovalService:
             self._execution_lock.release()
             raise ServiceError(500, "job_start_failed", "无法启动本机审批任务") from exc
         return copy.deepcopy(job)
+
+    def start_refresh_job(self) -> dict[str, Any]:
+        """Start one read-only dashboard refresh without accepting any inputs.
+
+        The service-level marker closes the small window before
+        ``refresh_dashboard`` creates its cross-process mutex/file lock.  The
+        refresh entrypoint then remains the authoritative guard against the
+        scheduled task and any independently launched refresh.
+        """
+
+        with self._state_lock:
+            if self._refresh_active:
+                raise ServiceError(
+                    409,
+                    "refresh_busy",
+                    "已有数据刷新任务正在执行，请勿重复点击",
+                )
+            if self._execution_lock.locked():
+                raise ServiceError(
+                    409,
+                    "approval_in_progress",
+                    "真实审批正在执行，暂不能刷新数据",
+                )
+
+            job_id = secrets.token_urlsafe(24)
+            job = {
+                "job_id": job_id,
+                "status": "queued",
+                "created_at": _utc_now_text(),
+                "started_at": None,
+                "finished_at": None,
+                "updated_month": None,
+                "message": "等待读取当前自然月 SRDPM 数据",
+            }
+            self._refresh_jobs[job_id] = job
+            self._refresh_active = True
+
+        worker = threading.Thread(
+            target=self._run_refresh_job,
+            args=(job_id,),
+            name=f"srdpm-dashboard-refresh-{job_id[:8]}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:
+            with self._state_lock:
+                job["status"] = "failed"
+                job["message"] = "无法启动本机数据刷新任务，当前看板未修改"
+                job["finished_at"] = _utc_now_text()
+                self._refresh_active = False
+            raise ServiceError(500, "refresh_start_failed", "无法启动本机数据刷新任务") from exc
+        return copy.deepcopy(job)
+
+    @staticmethod
+    def _refresh_failure_message(error: Exception) -> str:
+        """Map refresh errors to safe browser-facing messages only."""
+
+        try:
+            from refresh_dashboard import RefreshBusyError, RefreshCredentialError
+        except Exception:  # pragma: no cover - module is part of this project
+            RefreshBusyError = ()  # type: ignore[assignment,misc]
+            RefreshCredentialError = ()  # type: ignore[assignment,misc]
+        if isinstance(error, RefreshBusyError):
+            return "已有数据刷新或真实审批正在执行，当前看板未修改"
+        if isinstance(error, RefreshCredentialError):
+            return "未找到可用的 SRDPM 登录凭据，当前看板未修改"
+        return "数据刷新失败，现有数据和看板均未修改，请稍后重试"
+
+    def _run_refresh_job(self, job_id: str) -> None:
+        try:
+            with self._state_lock:
+                job = self._refresh_jobs[job_id]
+                job["status"] = "running"
+                job["started_at"] = _utc_now_text()
+                job["message"] = "正在读取当前自然月数据、重新审计并生成看板；不会提交审批"
+
+            result = self.refresh_runner(self.project_dir)
+            updated_month = getattr(result, "month", None)
+            if not isinstance(updated_month, str) or not MONTH_PATTERN.fullmatch(updated_month):
+                raise RuntimeError("refresh runner returned an invalid month")
+
+            with self._state_lock:
+                job = self._refresh_jobs[job_id]
+                job["status"] = "succeeded"
+                job["updated_month"] = updated_month
+                job["message"] = "数据已刷新，正在重新加载最新看板"
+                job["finished_at"] = _utc_now_text()
+        except Exception as exc:
+            with self._state_lock:
+                job = self._refresh_jobs[job_id]
+                job["status"] = "failed"
+                job["message"] = self._refresh_failure_message(exc)
+                job["finished_at"] = _utc_now_text()
+        finally:
+            with self._state_lock:
+                self._refresh_active = False
+
+    def get_refresh_job(self, job_id: str) -> dict[str, Any]:
+        with self._state_lock:
+            job = self._refresh_jobs.get(job_id)
+            if job is None:
+                raise ServiceError(404, "refresh_job_not_found", "数据刷新任务不存在")
+            return copy.deepcopy(job)
 
     def _initial_group_results(self, rebuilt: RebuiltPlan) -> list[dict[str, Any]]:
         return [
@@ -899,6 +1033,15 @@ class LocalApprovalRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            refresh_match = REFRESH_JOB_PATH_PATTERN.fullmatch(path)
+            if refresh_match:
+                self._require_api_security(require_origin=False)
+                self._send_json(
+                    200,
+                    {"ok": True, "job": self.service.get_refresh_job(refresh_match.group(1))},
+                )
+                return
+
             match = JOB_PATH_PATTERN.fullmatch(path)
             if match:
                 self._require_api_security(require_origin=False)
@@ -933,6 +1076,11 @@ class LocalApprovalRequestHandler(BaseHTTPRequestHandler):
                 job = self.service.start_job(request["ticket"])
                 self._send_json(202, {"ok": True, "job": job})
                 return
+            if path == "/api/v1/dashboard/refresh":
+                self._require_exact_object(data, set())
+                job = self.service.start_refresh_job()
+                self._send_json(202, {"ok": True, "job": job})
+                return
             raise ServiceError(404, "not_found", "请求路径不存在")
         except ServiceError as exc:
             self._send_service_error(exc)
@@ -960,6 +1108,7 @@ def create_server(
     credential_store: Any | None = None,
     credential_client_factory: Callable[[str, str], Any] = SRDPMClient.from_credentials,
     approval_confirmer: Callable[[PlanSummary], bool] = confirm_approval_with_windows,
+    refresh_runner: Callable[[Path], Any] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> LocalApprovalHTTPServer:
     if isinstance(port, bool) or not isinstance(port, int) or not (0 <= port <= 65_535):
@@ -971,6 +1120,7 @@ def create_server(
         credential_store=credential_store,
         credential_client_factory=credential_client_factory,
         approval_confirmer=approval_confirmer,
+        refresh_runner=refresh_runner,
         monotonic=monotonic,
     )
     return LocalApprovalHTTPServer((LISTEN_HOST, port), service)

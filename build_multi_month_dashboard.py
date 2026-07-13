@@ -8,7 +8,7 @@
 用法：
   python build_multi_month_dashboard.py
 """
-import json, os, re, glob, sys, io
+import json, os, re, glob, sys, io, tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -582,6 +582,100 @@ def build_enhanced_stats(raw_data):
     }
 
 
+def append_uncovered_pending_items(cats, approval_groups, raw_data):
+    """Expose pending raw details that no category 1-6 row represents.
+
+    Category seven is intentionally information-only.  It is the final safety
+    net for a pending SRDPM detail that the audit rules cannot classify, rather
+    than a hidden approval route.  Matching visible rows by their own scope
+    also prevents an exact-match failure in category four from being silently
+    mislabeled as "no issue".
+    """
+
+    seven = cats.get("seven")
+    if not isinstance(seven, dict):
+        return
+
+    raw_records = list(iter_unique_children(raw_data))
+    by_person_day = defaultdict(list)
+    for record in raw_records:
+        approve_id = str(record.get("approve_id") or "").strip()
+        if not approve_id:
+            continue
+        by_person_day[(str(record.get("date") or ""), str(record.get("person") or ""))].append(
+            record
+        )
+
+    covered_ids = set()
+
+    def same_text(left, right):
+        return str(left or "").strip() == str(right or "").strip()
+
+    def row_matches_record(category_key, item, record):
+        if category_key == "three":
+            # 工时异常的审批范围就是该人员当天整日的所有明细。
+            return True
+        child = record["child"]
+        project = item.get("project") if "project" in item else item.get("items")
+        if project is not None and not same_text(child.get("items"), project):
+            return False
+        if "title" in item and not same_text(child.get("title"), item.get("title")):
+            return False
+        if "content" in item and not same_text(child.get("content"), item.get("content")):
+            return False
+        if "hours" in item:
+            try:
+                if float(child.get("work_hours", 0) or 0) != float(item.get("hours", 0) or 0):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    for category_key in ("two", "three", "four", "five", "six"):
+        for item in cats.get(category_key, {}).get("items", []):
+            group_key = item.get("approval_group_key")
+            group = approval_groups.get(group_key) if group_key else None
+            if group:
+                covered_ids.update(normalize_approve_ids(group.get("approve_ids", [])))
+            covered_ids.update(normalize_approve_ids(item.get("approve_ids", "")))
+
+            date = str(item.get("date") or "")
+            person = str(item.get("person") or "")
+            if not date or not person:
+                continue
+            for record in by_person_day.get((date, person), []):
+                if row_matches_record(category_key, item, record):
+                    covered_ids.add(str(record["approve_id"]))
+
+    seven_items = seven.setdefault("items", [])
+    seen_ids = set()
+    for record in raw_records:
+        approve_id = str(record.get("approve_id") or "").strip()
+        if not approve_id or approve_id in covered_ids or approve_id in seen_ids:
+            continue
+        child = record["child"]
+        if child.get("status") == "通过":
+            continue
+        seen_ids.add(approve_id)
+        parts = [
+            str(child.get("items") or "").strip(),
+            str(child.get("title") or "").strip(),
+            str(child.get("content") or "").strip(),
+        ]
+        detail = " ".join(part for part in parts if part)
+        seven_items.append(
+            {
+                "date": record["date"],
+                "person": record["person"],
+                "detail": "未归入1-6类的待处理 SRDPM 明细" + (f"：{detail}" if detail else ""),
+                "status": "pending",
+            }
+        )
+
+    if seven_items:
+        seven["desc"] = f"{len(seven_items)}条待处理明细暂无法归入1-6类，仅供人工跟进"
+
+
 def main():
     print("扫描存档目录...")
     months = discover_months()
@@ -601,19 +695,7 @@ def main():
         )
         assign_primary_categories(cats, approval_groups)
         attach_groups_to_categories(cats, approval_groups)
-        represented_group_keys = {
-            item.get("approval_group_key")
-            for key in ("two", "three", "four", "five", "six")
-            for item in cats[key]["items"]
-            if item.get("approval_group_key")
-        }
-        for group_key, group in approval_groups.items():
-            if group_key not in represented_group_keys:
-                cats["seven"]["items"].append({
-                    "date": group["date"],
-                    "person": group["person"],
-                    "detail": f"未被1-6类覆盖的审批明细选择，共{group['item_count']}条明细",
-                })
+        append_uncovered_pending_items(cats, approval_groups, raw_data)
         approval_summary = summarize_groups(approval_groups)
         enhanced = build_enhanced_stats(raw_data)
 
@@ -656,8 +738,12 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f
 .month-btn.active .badge { background: rgba(255,255,255,0.3); color: #fff; }
 
 .header { background: linear-gradient(135deg, #1a73e8, #1557b0); color: #fff; padding: 20px 32px; }
+.header-main { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .header h1 { font-size: 22px; margin-bottom: 6px; }
 .header .meta { font-size: 13px; opacity: 0.85; }
+.btn-refresh-dashboard { flex: 0 0 auto; padding: 8px 14px; border: 1px solid rgba(255,255,255,.7); border-radius: 6px; background: rgba(255,255,255,.16); color: #fff; cursor: pointer; font-size: 13px; font-weight: 600; transition: all .2s; }
+.btn-refresh-dashboard:hover:not(:disabled) { background: rgba(255,255,255,.28); }
+.btn-refresh-dashboard:disabled { cursor: wait; opacity: .6; }
 
 
 .toolbar { padding: 12px 32px; background: #fff; border-bottom: 1px solid #e8e8e8; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
@@ -703,7 +789,8 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f
 body.approval-busy .month-btn,
 body.approval-busy .cat-nav-item,
 body.approval-busy .btn-approve,
-body.approval-busy .bulk-actions button { pointer-events: none; opacity: .55; }
+body.approval-busy .bulk-actions button,
+body.approval-busy .btn-refresh-dashboard { pointer-events: none; opacity: .55; }
 .status-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
 .status-badge.approved { background: #e6f7e6; color: #1a7a1a; border: 1px solid #b7e4b7; }
 .status-badge.pending { background: #fff3e0; color: #e65100; border: 1px solid #ffcc80; }
@@ -721,6 +808,8 @@ body.approval-busy .bulk-actions button { pointer-events: none; opacity: .55; }
 .cat-nav-item.auto.active { background: #c8e6c9; border-color: #1a7a1a; }
 .cat-nav-item.manual { border-color: #ffcc80; background: #fff3e0; color: #e65100; }
 .cat-nav-item.manual.active { background: #ffe0b2; border-color: #e65100; }
+.cat-nav-item.attention { border-color: #ffcc80; background: #fff3e0; color: #e65100; }
+.cat-nav-item.attention.active { background: #ffe0b2; border-color: #e65100; }
 .cat-nav-item.complete { border-color: #b7e4b7; background: #e6f7e6; color: #1a7a1a; }
 .cat-nav-item.complete.active { background: #c8e6c9; border-color: #1a7a1a; }
 
@@ -783,6 +872,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 
 @media (max-width: 768px) {
     .header { padding: 14px 16px; }
+    .header-main { align-items: flex-start; flex-direction: column; }
     .month-selector { padding: 10px 16px; }
     .category-nav { padding: 10px 16px; }
     .cat-nav-item { padding: 8px 12px; font-size: 13px; min-width: 100px; }
@@ -799,8 +889,13 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 </div>
 
 <div class="header" id="dashboardHeader">
-    <h1>📋 SRDPM 工时审批看板</h1>
-    <div class="meta" id="headerMeta">加载中...</div>
+    <div class="header-main">
+        <div>
+            <h1>📋 SRDPM 工时审批看板</h1>
+            <div class="meta" id="headerMeta">加载中...</div>
+        </div>
+        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()">↻ 重新读取当前月数据</button>
+    </div>
 </div>
 
 <div class="category-nav" id="categoryNav"></div>
@@ -1100,7 +1195,7 @@ function switchMonth(ml) {
     const display = ALL_DATA[ml].display;
     const fetchTime = ALL_DATA[ml].fetch_time || "";
     document.getElementById("headerMeta").textContent =
-        `当前查看：${display} · 数据拉取：${fetchTime ? fetchTime.substring(0, 10) : '未知'} · 审批数据存档不变`;
+        `当前查看：${display} · 数据拉取：${fetchTime || '未知'} · 审批数据存档不变`;
 
     renderCategoryNav();
     switchTab("one");
@@ -1114,33 +1209,35 @@ function renderCategoryNav() {
     for (const key of ALL_CATS) {
         const cat = CAT_DATA[key];
         const rowCount = cat.items.length;
-        let cls = "auto";
+        let cls = "complete";
         let statusText;
         if (NO_APPROVE_CATS.includes(key)) {
-            cls = rowCount > 0 ? "manual" : "complete";
-            statusText = `信息展示 · ${rowCount}条`;
+            const pending = rowCount;
+            cls = pending > 0 ? "attention" : "complete";
+            statusText = pending > 0
+                ? `待处理${pending}条 · 信息展示`
+                : "无待处理 · 信息展示";
         } else {
-            const groupKeys = groupKeysForCategory(key);
+            // A row may be repeated in another category but still needs attention
+            // here.  This is deliberately view-local only: it must not change the
+            // global unique approval statistics or selection plan.
+            const groupKeys = groupKeysForCategory(key, false);
             const counts = deriveCounts(groupKeys);
-            if (groupKeys.length === 0 && rowCount > 0) {
-                cls = "auto";
-                statusText = `明细视图 · ${rowCount}条 · 审批随所属选择`;
-                html += `<button class="cat-nav-item ${cls}" data-cat="${key}" onclick="switchTab('${key}')">
-                    <span>${escapeHtml(cat.title)}</span>
-                    <span class="cat-status">${statusText}</span>
-                </button>`;
-                continue;
-            }
             const manualTotal = counts.manual.pending + counts.manual.selected + counts.manual.approved;
             const autoTotal = counts.auto.pending + counts.auto.selected + counts.auto.approved;
             const selected = counts.manual.selected + counts.auto.selected;
             const pending = counts.manual.pending + counts.auto.pending;
             const approved = counts.manual.approved + counts.auto.approved;
-            cls = pending === 0 && selected === 0 ? "complete" : (manualTotal > 0 ? "manual" : "auto");
-            const modeText = manualTotal > 0 && autoTotal > 0
+            const unavailable = cat.items.filter(item => item.approval_unavailable_reason).length;
+            const unresolved = pending + selected + unavailable;
+            cls = unresolved > 0 ? "attention" : "complete";
+            const modeText = manualTotal === 0 && autoTotal === 0
+                ? "无审批选择"
+                : (manualTotal > 0 && autoTotal > 0
                 ? `人工${manualTotal}条/候选${autoTotal}条`
-                : (manualTotal > 0 ? `人工${manualTotal}条` : `候选${autoTotal}条`);
-            statusText = `${modeText} · 待处理${pending} · 已选${selected} · 已审批${approved} · ${rowCount}条明细`;
+                : (manualTotal > 0 ? `人工${manualTotal}条` : `候选${autoTotal}条`));
+            statusText = `${modeText} · 待处理${unresolved} · 已选${selected} · 已审批${approved} · ${rowCount}条明细` +
+                (unavailable > 0 ? ` · ${unavailable}条需人工处理` : "");
         }
 
         html += `<button class="cat-nav-item ${cls}" data-cat="${key}" onclick="switchTab('${key}')">
@@ -1773,6 +1870,8 @@ function setApprovalBusy(active) {
     document.querySelectorAll(".toolbar button").forEach(button => {
         button.disabled = active;
     });
+    const refreshButton = document.getElementById("btnRefreshDashboard");
+    if (refreshButton) refreshButton.disabled = active;
     updatePendingCount();
 }
 
@@ -1828,6 +1927,84 @@ async function pollApprovalJob(jobId) {
     const error = new Error("等待审批结果超时；任务可能仍在执行，请勿重复审批，并到 SRDPM 人工核对");
     error.jobMayBeRunning = true;
     throw error;
+}
+
+async function pollDashboardRefreshJob(jobId) {
+    const deadline = Date.now() + 20 * 60 * 1000;
+    while (Date.now() < deadline) {
+        await delay(700);
+        const data = await requestLocalApprovalApi(`/dashboard/refresh/jobs/${encodeURIComponent(jobId)}`);
+        const job = data.job;
+        if (!job || job.job_id !== jobId) {
+            throw new Error("本机服务返回了不匹配的数据刷新任务");
+        }
+        if (job.status === "succeeded" || job.status === "failed") return job;
+        setApprovalFeedback(
+            "info",
+            job.message || "正在读取当前自然月数据、重新审计并生成看板；不会提交审批…"
+        );
+    }
+    const error = new Error("等待数据刷新结果超时；任务可能仍在进行，请勿重复点击并稍后重新打开看板");
+    error.jobMayBeRunning = true;
+    throw error;
+}
+
+async function refreshDashboardData() {
+    if (approvalExecutionActive) return;
+    if (!LOCAL_SERVICE) {
+        // A file:// page cannot safely turn a top-level navigation into a
+        // credential-backed refresh.  Open the protected same-origin page first.
+        setApprovalFeedback(
+            "info",
+            "正在打开本机看板；为保护登录凭据，请在打开后的页面点击“重新读取当前月数据”。"
+        );
+        location.assign(`${LOCAL_SERVICE_ORIGIN}/`);
+        return;
+    }
+
+    let reloadScheduled = false;
+    setApprovalBusy(true);
+    setApprovalFeedback(
+        "info",
+        "正在重新读取 SRDPM 当前自然月数据、重新审计并生成看板；此操作不会提交审批…"
+    );
+    try {
+        const started = await requestLocalApprovalApi("/dashboard/refresh", {
+            method: "POST",
+            body: {}
+        });
+        const jobId = started.job?.job_id;
+        if (!jobId) {
+            const error = new Error("本机服务没有返回数据刷新任务编号");
+            error.responseReceived = true;
+            throw error;
+        }
+        const job = await pollDashboardRefreshJob(jobId);
+        if (job.status !== "succeeded" || typeof job.updated_month !== "string") {
+            const error = new Error(job.message || "数据刷新未完成，现有数据和看板均未修改");
+            error.responseReceived = true;
+            throw error;
+        }
+
+        // An archive refresh can change the meaning of a stable ID (for example,
+        // after an operator corrected its source fields).  Never carry a prior
+        // browser selection into the newly generated snapshot.
+        localStorage.removeItem(getStorageKey(job.updated_month));
+        setApprovalFeedback("success", "数据已刷新，已清除该月旧选择，正在重新加载最新看板…");
+        reloadScheduled = true;
+        setTimeout(() => location.reload(), 350);
+    } catch (error) {
+        const maybeRunning = error?.jobMayBeRunning || error?.responseReceived !== true;
+        const followUp = maybeRunning
+            ? "\\n任务状态可能仍在更新，请勿重复点击；稍后重新打开看板核对。"
+            : "\\n现有数据、看板和页面选择均已保留。";
+        setApprovalFeedback(
+            "error",
+            `数据刷新未完成：${error?.message || "未知错误"}${followUp}`
+        );
+    } finally {
+        if (!reloadScheduled) setApprovalBusy(false);
+    }
 }
 
 function applyApprovalJobResult(job, executionMonth) {
@@ -2163,9 +2340,28 @@ document.addEventListener("DOMContentLoaded", init);
     # Inject data
     html = html.replace("__ALL_DATA_PLACEHOLDER__", all_data_json)
 
-    # Write output
-    with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
-        f.write(html)
+    # Publish a complete file atomically.  A browser or the localhost service
+    # must never observe the partially written multi-megabyte dashboard.
+    output_path = Path(OUTPUT_HTML)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            stream.write(html)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary_path = Path(stream.name)
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
     print(f"\n✅ 多月看板已生成: {OUTPUT_HTML}")
     print(f"   可用月份: {', '.join(months)}")

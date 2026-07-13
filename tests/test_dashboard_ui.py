@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -11,21 +12,33 @@ from playwright.sync_api import sync_playwright
 class DashboardUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        dashboard.main()
-        cls.playwright = sync_playwright().start()
+        cls._temporary_output = tempfile.TemporaryDirectory()
+        cls._original_output_html = dashboard.OUTPUT_HTML
+        dashboard.OUTPUT_HTML = Path(cls._temporary_output.name) / "dashboard-under-test.html"
         try:
+            dashboard.main()
+            cls.playwright = sync_playwright().start()
             cls.browser = cls.playwright.chromium.launch(headless=True)
+            cls.dashboard_uri = Path(dashboard.OUTPUT_HTML).resolve().as_uri()
         except Exception as exc:  # pragma: no cover - depends on local browser install
-            cls.playwright.stop()
+            if hasattr(cls, "browser"):
+                cls.browser.close()
+            if hasattr(cls, "playwright"):
+                cls.playwright.stop()
+            dashboard.OUTPUT_HTML = cls._original_output_html
+            cls._temporary_output.cleanup()
             raise unittest.SkipTest(f"Playwright Chromium 不可用：{exc}")
-        cls.dashboard_uri = Path(dashboard.OUTPUT_HTML).resolve().as_uri()
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "browser"):
-            cls.browser.close()
-        if hasattr(cls, "playwright"):
-            cls.playwright.stop()
+        try:
+            if hasattr(cls, "browser"):
+                cls.browser.close()
+            if hasattr(cls, "playwright"):
+                cls.playwright.stop()
+        finally:
+            dashboard.OUTPUT_HTML = cls._original_output_html
+            cls._temporary_output.cleanup()
 
     def setUp(self):
         self.context = self.browser.new_context(accept_downloads=True)
@@ -35,7 +48,14 @@ class DashboardUiTests(unittest.TestCase):
         self.page_errors = []
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         self.page.goto(self.dashboard_uri, wait_until="domcontentloaded")
-        self.page.wait_for_selector("#pendingCount")
+        self.page.wait_for_function(
+            """() => {
+                const element = document.querySelector('#pendingCount');
+                return Boolean(element && element.textContent.trim());
+            }""",
+            timeout=10_000,
+        )
+        self.current_month = self.page.evaluate("currentMonth")
 
     def tearDown(self):
         self.context.close()
@@ -50,6 +70,7 @@ class DashboardUiTests(unittest.TestCase):
         credential_configured=True,
         initial_fragment="",
         initial_groups=None,
+        refresh_job_factory=None,
     ):
         requests = []
         expected = {
@@ -170,6 +191,38 @@ class DashboardUiTests(unittest.TestCase):
                     body=json.dumps({"ok": True, "job": job_factory()}),
                 )
                 return
+            if path == "/api/v1/dashboard/refresh":
+                route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "ok": True,
+                            "job": {
+                                "job_id": "test-refresh-job-id-1234567890",
+                                "status": "queued",
+                            },
+                        }
+                    ),
+                )
+                return
+            if path == "/api/v1/dashboard/refresh/jobs/test-refresh-job-id-1234567890":
+                job = (
+                    refresh_job_factory()
+                    if refresh_job_factory is not None
+                    else {
+                        "job_id": "test-refresh-job-id-1234567890",
+                        "status": "succeeded",
+                        "updated_month": self.current_month,
+                        "message": "done",
+                    }
+                )
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"ok": True, "job": job}),
+                )
+                return
             route.fulfill(status=404, content_type="application/json", body='{"ok":false}')
 
         self.context.route("http://127.0.0.1:8765/**", route_local_service)
@@ -177,7 +230,14 @@ class DashboardUiTests(unittest.TestCase):
             f"http://127.0.0.1:8765/{initial_fragment}",
             wait_until="domcontentloaded",
         )
-        self.page.wait_for_selector("#pendingCount")
+        self.page.wait_for_function(
+            """() => {
+                const element = document.querySelector('#pendingCount');
+                return Boolean(element && element.textContent.trim());
+            }""",
+            timeout=10_000,
+        )
+        self.current_month = self.page.evaluate("currentMonth")
         self.assertEqual(
             self.page.locator("#approvalServiceStatus").inner_text(),
             "本机审批服务：已连接",
@@ -185,26 +245,125 @@ class DashboardUiTests(unittest.TestCase):
         return requests, expected
 
     def test_initial_counts_use_exact_selectable_rows_and_unique_ids(self):
+        expected = self.page.evaluate(
+            """() => {
+                const groups = Object.values(APPROVAL_GROUPS);
+                const countOpen = mode => {
+                    const open = groups.filter(group =>
+                        group.review_mode === mode && getGroupStatus(group.group_key) !== 'approved'
+                    );
+                    return {
+                        selections: open.length,
+                        ids: open.reduce((sum, group) => sum + (group.approve_ids || []).length, 0)
+                    };
+                };
+                return {
+                    month: currentMonth,
+                    manual: countOpen('manual'),
+                    auto: countOpen('auto'),
+                    platformRows: CAT_DATA.five.items.length,
+                    normalRows: CAT_DATA.six.items.length,
+                    totalRows: ALL_DATA[currentMonth].enhanced.total_count
+                };
+            }"""
+        )
         pending = self.page.locator("#pendingCount").inner_text()
         self.assertEqual(
             pending,
-            "需人工审核：4条选择/36个待审ID（已标记0） · 可审批候选：448条选择/448个待审ID（已选0）",
+            f"需人工审核：{expected['manual']['selections']}条选择/{expected['manual']['ids']}个待审ID（已标记0） · "
+            f"可审批候选：{expected['auto']['selections']}条选择/{expected['auto']['ids']}个待审ID（已选0）",
         )
-        july_button = self.page.locator('.month-btn[data-month="2026-07"]')
-        self.assertIn("4人工", july_button.inner_text())
-        self.assertIn("448候选", july_button.inner_text())
+        month_button = self.page.locator(f'.month-btn[data-month="{expected["month"]}"]')
+        self.assertIn(f"{expected['manual']['selections']}人工", month_button.inner_text())
+        self.assertIn(f"{expected['auto']['selections']}候选", month_button.inner_text())
 
         self.page.locator('.cat-nav-item[data-cat="five"]').click()
         platform_status = self.page.locator('.cat-nav-item[data-cat="five"] .cat-status').inner_text()
-        self.assertIn("52条", platform_status)
-        self.assertIn("52条", platform_status)
+        self.assertIn(f"{expected['platformRows']}条明细", platform_status)
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
-        self.assertIn("396条明细", self.page.locator('.cat-nav-item[data-cat="six"] .cat-status').inner_text())
-        self.assertIn("484条明细", self.page.locator("#statsMeta").inner_text())
+        self.assertIn(
+            f"{expected['normalRows']}条明细",
+            self.page.locator('.cat-nav-item[data-cat="six"] .cat-status').inner_text(),
+        )
+        self.assertIn(f"{expected['totalRows']}条明细", self.page.locator("#statsMeta").inner_text())
+        self.assert_no_page_errors()
+
+    def test_category_navigation_colors_follow_unresolved_items(self):
+        self.page.evaluate(
+            """() => {
+                CAT_DATA = {
+                    one: {title: '一、漏报人员', items: [{person: 'A'}]},
+                    two: {title: '二、请假', items: [{approval_group_key: 'auto-pending'}]},
+                    three: {title: '三、工时异常', items: [{approval_group_key: 'manual-pending'}]},
+                    four: {title: '四、项目归属异常', items: [{approval_group_key: 'already-approved'}]},
+                    five: {title: '五、平台类', items: [{approval_group_key: 'selected-pending'}]},
+                    six: {title: '六、正常申报', items: [{approval_unavailable_reason: 'cannot match'}]},
+                    seven: {title: '七、其他待定', items: [{detail: 'needs review'}]}
+                };
+                APPROVAL_GROUPS = {
+                    'auto-pending': {group_key: 'auto-pending', review_mode: 'auto', approve_ids: ['1']},
+                    'manual-pending': {group_key: 'manual-pending', review_mode: 'manual', approve_ids: ['2']},
+                    'already-approved': {group_key: 'already-approved', review_mode: 'manual', approve_ids: ['3'], status: 'approved'},
+                    'selected-pending': {group_key: 'selected-pending', review_mode: 'auto', approve_ids: ['4']}
+                };
+                approvalState = {'selected-pending': 'selected'};
+                renderCategoryNav();
+            }"""
+        )
+
+        attention_keys = ["one", "two", "three", "five", "six", "seven"]
+        for key in attention_keys:
+            self.assertTrue(
+                self.page.locator(f'.cat-nav-item[data-cat="{key}"]').evaluate(
+                    "node => node.classList.contains('attention')"
+                ),
+                key,
+            )
+        self.assertTrue(
+            self.page.locator('.cat-nav-item[data-cat="four"]').evaluate(
+                "node => node.classList.contains('complete')"
+            )
+        )
+        self.assertIn(
+            "待处理1条", self.page.locator('.cat-nav-item[data-cat="one"] .cat-status').inner_text()
+        )
+        self.assertIn(
+            "待处理1条", self.page.locator('.cat-nav-item[data-cat="seven"] .cat-status').inner_text()
+        )
+        self.assert_no_page_errors()
+
+    def test_ui_refresh_uses_read_only_endpoint_and_clears_updated_month_selection(self):
+        requests, _ = self.open_mock_local_service(lambda: {})
+        group_key = self.page.evaluate(
+            """() => {
+                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                localStorage.setItem(getStorageKey(currentMonth), JSON.stringify({[group.group_key]: 'selected'}));
+                return group.group_key;
+            }"""
+        )
+
+        self.page.locator("#btnRefreshDashboard").click()
+        self.page.wait_for_timeout(1500)
+
+        refresh_start = [item for item in requests if item["path"] == "/api/v1/dashboard/refresh"]
+        refresh_poll = [
+            item
+            for item in requests
+            if item["path"] == "/api/v1/dashboard/refresh/jobs/test-refresh-job-id-1234567890"
+        ]
+        self.assertEqual(1, len(refresh_start))
+        self.assertEqual({}, refresh_start[0]["body"])
+        self.assertGreaterEqual(len(refresh_poll), 1)
+        self.assertFalse(any("/approval/" in item["path"] for item in requests))
+        self.assertFalse(any("/credentials/" in item["path"] for item in requests))
+        self.assertIsNone(
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
+        )
+        self.assertNotEqual("", group_key)
         self.assert_no_page_errors()
 
     def test_viewing_automatic_categories_does_not_mutate_local_state(self):
-        storage_key = "srdpm_approval_v3_2026-07"
+        storage_key = f"srdpm_approval_v3_{self.current_month}"
         self.assertIsNone(self.page.evaluate("key => localStorage.getItem(key)", storage_key))
         self.page.locator('.cat-nav-item[data-cat="five"]').click()
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
@@ -216,7 +375,7 @@ class DashboardUiTests(unittest.TestCase):
         first_action = self.page.locator("#panel_three tbody .btn-approve").first
         first_action.click()
         state = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
         )
         self.assertEqual(len(state), 1)
         key, value = next(iter(state.items()))
@@ -229,30 +388,47 @@ class DashboardUiTests(unittest.TestCase):
 
         self.page.locator("#panel_three tbody .btn-approve.done").first.click()
         state = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
         )
         self.assertEqual(state, {})
         self.assert_no_page_errors()
 
     def test_bulk_auto_selection_exports_unique_offline_plan(self):
+        expected = self.page.evaluate(
+            """() => {
+                const groups = Object.values(APPROVAL_GROUPS).filter(group =>
+                    group.review_mode === 'auto' && getGroupStatus(group.group_key) !== 'approved'
+                );
+                return {
+                    selections: groups.length,
+                    ids: groups.reduce((sum, group) => sum + (group.approve_ids || []).length, 0)
+                };
+            }"""
+        )
         self.page.locator('.cat-nav-item[data-cat="six"]').click()
         self.page.locator("button[onclick='selectAllAutoGroups()']").click()
-        self.assertIn("已选448", self.page.locator("#pendingCount").inner_text())
-        self.assertIn("448条选择/448个待审ID", self.page.locator("#btnConfirm").inner_text())
+        self.assertIn(f"已选{expected['selections']}", self.page.locator("#pendingCount").inner_text())
+        self.assertIn(
+            f"{expected['selections']}条选择/{expected['ids']}个待审ID",
+            self.page.locator("#btnConfirm").inner_text(),
+        )
 
         self.page.once("dialog", lambda dialog: dialog.accept())
         with self.page.expect_download() as download_info:
             self.page.locator("#btnConfirm").click()
         download = download_info.value
-        self.assertEqual(download.suggested_filename, "srdpm-approval-plan-2026-07.json")
+        self.assertEqual(
+            download.suggested_filename,
+            f"srdpm-approval-plan-{self.current_month}.json",
+        )
         parsed_plan = load_plan(Path(download.path()))
         parsed_summary = summarize_plan(parsed_plan)
         plan = self.page.evaluate("window.__lastApprovalPlan")
         self.assertEqual(plan["schema_version"], 1)
-        self.assertEqual(plan["summary"]["selection_count"], 448)
-        self.assertEqual(plan["summary"]["item_count"], 448)
+        self.assertEqual(plan["summary"]["selection_count"], expected["selections"])
+        self.assertEqual(plan["summary"]["item_count"], expected["ids"])
         self.assertEqual(parsed_summary.group_count, plan["summary"]["group_count"])
-        self.assertEqual(parsed_summary.id_count, 448)
+        self.assertEqual(parsed_summary.id_count, expected["ids"])
         ids = [approve_id for group in plan["groups"] for approve_id in group["approve_ids"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assert_no_page_errors()
@@ -269,7 +445,7 @@ class DashboardUiTests(unittest.TestCase):
         self.assertEqual(f"{parsed.scheme}://{parsed.netloc}", "http://127.0.0.1:8765")
         self.assertEqual(set(payload), {"version", "month", "group_keys"})
         self.assertEqual(payload["version"], 2)
-        self.assertEqual(payload["month"], "2026-07")
+        self.assertEqual(payload["month"], self.current_month)
         self.assertEqual(len(payload["group_keys"]), 1)
         self.assertNotIn("approve_ids", json.dumps(payload))
         self.assertNotIn("person", json.dumps(payload))
@@ -307,7 +483,7 @@ class DashboardUiTests(unittest.TestCase):
         stale_json = json.dumps({stale["group_key"]: "selected"})
         self.context.add_init_script(
             script=f"""if (location.hostname === '127.0.0.1') {{
-                localStorage.setItem('srdpm_approval_v3_2026-07', {json.dumps(stale_json)});
+                localStorage.setItem('srdpm_approval_v3_{self.current_month}', {json.dumps(stale_json)});
             }}"""
         )
 
@@ -320,13 +496,13 @@ class DashboardUiTests(unittest.TestCase):
 
         self.assertEqual(urlparse(self.page.url).fragment, "")
         state = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
         )
         self.assertEqual(state, {selected["group_key"]: "selected"})
         prepare = next(item for item in requests if item["path"] == "/api/v1/approval/prepare")
         self.assertEqual(
             prepare["body"],
-            {"month": "2026-07", "group_keys": [selected["group_key"]]},
+            {"month": self.current_month, "group_keys": [selected["group_key"]]},
         )
         self.assertFalse(any(item["path"] == "/api/v1/approval/execute" for item in requests))
         self.assertIn("P/HANDOFF", self.page.locator("#approvalConfirmOverlay").inner_text())
@@ -390,7 +566,7 @@ class DashboardUiTests(unittest.TestCase):
                 "approval_selection": json.dumps(
                     {
                         "version": 2,
-                        "month": "2026-07",
+                        "month": self.current_month,
                         "group_keys": ["grp_ffffffffffffffffffff"],
                     }
                 )
@@ -428,6 +604,11 @@ class DashboardUiTests(unittest.TestCase):
         self.assert_no_page_errors()
 
     def test_platform_selected_rows_can_be_cancelled_in_platform_view(self):
+        expected_auto_selected = self.page.evaluate(
+            """() => Object.values(APPROVAL_GROUPS).filter(group =>
+                group.review_mode === 'auto' && getGroupStatus(group.group_key) !== 'approved'
+            ).length"""
+        )
         self.page.locator("button[onclick='selectAllAutoGroups()']").click()
         self.page.locator('.cat-nav-item[data-cat="five"]').click()
 
@@ -440,15 +621,17 @@ class DashboardUiTests(unittest.TestCase):
         )
 
         before = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
         )
-        self.assertEqual(len(before), 448)
+        self.assertEqual(len(before), expected_auto_selected)
         self.page.locator("#panel_five .btn-approve.done").first.click()
         after = json.loads(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
         )
-        self.assertEqual(len(after), 447)
-        self.assertIn("已选447", self.page.locator("#pendingCount").inner_text())
+        self.assertEqual(len(after), expected_auto_selected - 1)
+        self.assertIn(
+            f"已选{expected_auto_selected - 1}", self.page.locator("#pendingCount").inner_text()
+        )
         self.assertEqual(
             self.page.locator(".cat-nav-item.active").get_attribute("data-cat"), "five"
         )
@@ -474,7 +657,7 @@ class DashboardUiTests(unittest.TestCase):
             self.page.locator(".cat-nav-item.active").get_attribute("data-cat"), "six"
         )
         self.assertIsNone(
-            self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
         )
         self.assert_no_page_errors()
 
@@ -549,14 +732,21 @@ class DashboardUiTests(unittest.TestCase):
 
         prepare = next(item for item in requests if item["path"] == "/api/v1/approval/prepare")
         execute = next(item for item in requests if item["path"] == "/api/v1/approval/execute")
-        self.assertEqual(prepare["body"], {"month": "2026-07", "group_keys": [group_key]})
+        self.assertEqual(
+            prepare["body"], {"month": self.current_month, "group_keys": [group_key]}
+        )
         self.assertEqual(execute["body"], {"ticket": "one-use-ticket"})
         self.assertTrue(all(item["csrf"] == "test-csrf-token-with-at-least-32-characters" for item in requests))
         self.assertEqual(
             self.page.evaluate("key => getGroupStatus(key)", group_key), "approved"
         )
         self.assertEqual(
-            json.loads(self.page.evaluate("localStorage.getItem('srdpm_approval_v3_2026-07')")),
+            json.loads(
+                self.page.evaluate(
+                    "key => localStorage.getItem(key)",
+                    f"srdpm_approval_v3_{self.current_month}",
+                )
+            ),
             {},
         )
         self.assert_no_page_errors()
