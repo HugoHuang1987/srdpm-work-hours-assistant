@@ -896,6 +896,9 @@ body.approval-busy .btn-refresh-dashboard { pointer-events: none; opacity: .55; 
 .bulk-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; padding: 10px 12px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e8e8e8; }
 .bulk-actions button { padding: 6px 12px; border-radius: 5px; cursor: pointer; }
 .bulk-note { font-size: 12px; color: #e65100; }
+.pending-only-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 7px 12px; border: 1px solid #f0a000; border-radius: 6px; background: #fff8e1; color: #8a5200; font-size: 13px; font-weight: 700; cursor: pointer; }
+.pending-only-toggle:hover { background: #ffefbd; border-color: #d88900; }
+.pending-only-toggle input { width: 16px; height: 16px; margin: 0; accent-color: #e67e22; cursor: pointer; }
 
 .category-nav { display: flex; gap: 10px; padding: 16px 32px; background: #fff; border-bottom: 2px solid #e8e8e8; overflow-x: auto; flex-wrap: wrap; align-items: stretch; }
 .cat-nav-item { display: flex; flex-direction: column; align-items: flex-start; padding: 10px 16px; border-radius: 8px; border: 2px solid #e0e0e0; background: #fafafa; color: #444; cursor: pointer; font-size: 14px; font-weight: 600; transition: all 0.2s; min-width: 120px; }
@@ -951,10 +954,10 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .multi-filter-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 180px; max-height: 260px; overflow: auto; padding: 8px; background: #fff; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 8px 22px rgba(0,0,0,.15); }
 .multi-filter-menu label { display: block; padding: 5px 6px; white-space: nowrap; cursor: pointer; }
 .multi-filter-menu input { margin-right: 7px; }
-.hours-summary { border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 260px; }
-.hours-summary h4 { position: sticky; left: 0; margin: 0; padding: 9px 12px; background: #f5f7fb; color: #334; font-size: 14px; }
-.hours-summary table { font-size: 12px; }
-.hours-summary th, .hours-summary td { padding: 6px 9px; text-align: right; }
+.hours-summary { width: 100%; min-height: 320px; border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 520px; }
+.hours-summary h4 { position: sticky; left: 0; margin: 0; padding: 11px 14px; background: #f5f7fb; color: #334; font-size: 15px; }
+.hours-summary table { width: 100%; min-width: 0; font-size: 13px; }
+.hours-summary th, .hours-summary td { padding: 8px 11px; text-align: right; }
 .hours-summary th:first-child, .hours-summary td:first-child { position: sticky; left: 0; text-align: left; background: #fff; }
 .hours-summary thead th:first-child { background: #fafafa; }
 @media (max-width: 1100px) { .six-tools-row { grid-template-columns: 1fr; } }
@@ -1009,7 +1012,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
             <h1>📋 SRDPM 工时审批看板</h1>
             <div class="meta" id="headerMeta">加载中...</div>
         </div>
-        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()">↻ 重新读取当前月数据</button>
+        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()" title="只从 SRDPM 读取当前自然月；历史月份沿用本地归档">↻ 重新读取当前月（不重拉历史）</button>
     </div>
 </div>
 
