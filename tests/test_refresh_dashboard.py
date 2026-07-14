@@ -120,6 +120,9 @@ class RefreshDashboardTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary.name)
         (self.project / "project_mapping.json").write_text("{}", encoding="utf-8")
+        (self.project / refresh.CHIP_HISTORY_NAME).write_text(
+            '{"schema_version":1,"chips":["T963D4Z"]}', encoding="utf-8"
+        )
         self.month = "2026-07"
         self.month_dir = self.project / "srdpm_archive" / self.month
         self.month_dir.mkdir(parents=True)
@@ -143,7 +146,10 @@ class RefreshDashboardTests(unittest.TestCase):
     def _snapshot_published_files(self):
         paths = [
             self.month_dir / name for name in refresh.REQUIRED_MONTH_ARTIFACTS
-        ] + [self.project / refresh.DASHBOARD_NAME]
+        ] + [
+            self.project / refresh.CHIP_HISTORY_NAME,
+            self.project / refresh.DASHBOARD_NAME,
+        ]
         return {path: path.read_bytes() for path in paths}
 
     def _refresh(self, **overrides):
@@ -206,7 +212,7 @@ class RefreshDashboardTests(unittest.TestCase):
             result = self._refresh()
 
         self.assertEqual(self.month, result.month)
-        self.assertEqual(4, len(result.published_paths))
+        self.assertEqual(5, len(result.published_paths))
         self.assertEqual([("offline-user", "offline-password")], self.fetch.login_inputs)
         self.assertEqual(1, len(self.fetch.fetch_inputs))
         self.assertEqual(1, len(self.fetch.audit_inputs))
@@ -247,6 +253,13 @@ class RefreshDashboardTests(unittest.TestCase):
             self._refresh(credential_store=missing_store)
 
         self.assertEqual(before, self._snapshot_published_files())
+
+    def test_missing_chip_history_stops_before_login(self):
+        (self.project / refresh.CHIP_HISTORY_NAME).unlink()
+        with self.assertRaisesRegex(refresh.RefreshError, "机芯历史库不存在"):
+            self._refresh()
+        self.assertEqual([], self.fetch.login_inputs)
+        self.assertEqual([], self.fetch.fetch_inputs)
         self.assertEqual([], self.fetch.login_inputs)
         self.assertEqual([], self.dashboard.calls)
         self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())

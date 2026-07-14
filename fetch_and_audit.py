@@ -16,7 +16,7 @@ SRDPM 工时数据拉取 + 审核 - 通用版（支持任意月份）
     2026-07/
       ...
 """
-import requests, json, time, re, os, sys, io, warnings, argparse, shutil
+import requests, json, time, re, os, sys, io, warnings, argparse, shutil, tempfile
 from playwright.sync_api import sync_playwright
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -38,6 +38,7 @@ BASE_API = "https://rd-mokadisplay.tcl.com/srdpm-api/workload/approve"
 PROJECT_DIR = Path(__file__).resolve().parent
 OUT_DIR = str(PROJECT_DIR)
 ARCHIVE_DIR = os.path.join(OUT_DIR, "srdpm_archive")
+CHIP_HISTORY_NAME = "chip_history.json"
 VERIFY_TLS = os.environ.get("SRDPM_VERIFY_TLS", "true").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -438,6 +439,75 @@ def chip_normalize(code):
     return m.group(1), m.group(2), m.group(3) or ''
 
 
+def _chip_codes_from_person_projects(person_projects):
+    """提取当前 Wiki 映射中的机芯代码，不保留人员授权关系。"""
+    return {
+        value.split('/')[-1].strip().upper()
+        for values in person_projects.values()
+        for value in values
+        if value.split('/')[-1].strip()
+    }
+
+
+def load_and_update_chip_history(person_projects):
+    """合并当前 Wiki 机芯到只增不减的历史库，并返回全部历史代码。"""
+    history_path = Path(OUT_DIR) / CHIP_HISTORY_NAME
+    historical = set()
+    if not history_path.is_file():
+        raise ValueError(f'机芯历史库不存在，拒绝在可能遗忘旧机芯的情况下继续: {history_path}')
+    try:
+        payload = json.loads(history_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f'机芯历史库无法读取: {history_path}') from exc
+    if payload.get('schema_version') != 1 or not isinstance(payload.get('chips'), list):
+        raise ValueError(f'机芯历史库格式不合法: {history_path}')
+    if any(not isinstance(code, str) or not code.strip() for code in payload['chips']):
+        raise ValueError(f'机芯历史库包含无效机芯: {history_path}')
+    historical.update(code.strip().upper() for code in payload['chips'])
+
+    merged = historical | _chip_codes_from_person_projects(person_projects)
+    normalized_payload = {
+        'schema_version': 1,
+        'purpose': '只增不减地记住曾在 Wiki 项目负荷映射中出现过的机芯；不代表当前人员仍有申报权限。',
+        'chips': sorted(merged),
+    }
+    if merged != historical:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f'.{CHIP_HISTORY_NAME}.', suffix='.tmp', dir=history_path.parent
+        )
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as output:
+                json.dump(normalized_payload, output, ensure_ascii=False, indent=2)
+                output.write('\n')
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_name, history_path)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+    return sorted(merged)
+
+
+def build_chip_norm(codes):
+    result = {}
+    for code in codes:
+        pure = code.split('/')[-1].strip().upper()
+        if not pure:
+            continue
+        pref, num, suf = chip_normalize(pure)
+        if pref:
+            result[pure] = (pref, num, suf)
+    return result
+
+
+def _explicit_d_revision(suffix):
+    """仅提取明确写出的 D+数字版本；D4 与 D5 必须严格区分。"""
+    # 完整项目码中的 DD6/DA6 是方案后缀，不是 D4/D5 机芯版本。
+    match = re.match(r'D([45])', suffix or '')
+    return match.group(1) if match else None
+
+
 def extract_chip_candidates(project_name):
     if not project_name or project_name == '-':
         return []
@@ -470,14 +540,18 @@ def match_chip(candidate_tuple, allowed_chips, wiki_chips_norm):
             continue
         wiki_pref, wiki_num, wiki_suf = wiki_chips_norm[chip_pure]
         if cand_pref == wiki_pref:
-            if cand_num == wiki_num:
-                return chip_pure
-            if wiki_num.startswith(cand_num) or wiki_num.endswith(cand_num):
+            cand_revision = _explicit_d_revision(cand_suf)
+            wiki_revision = _explicit_d_revision(wiki_suf)
+            if cand_revision and wiki_revision and cand_revision != wiki_revision:
+                continue
+            if (cand_num == wiki_num or wiki_num.startswith(cand_num) or
+                    wiki_num.endswith(cand_num)):
                 return chip_pure
     return None
 
 
-def check_project_ownership(person, customer, project_name, chip_candidates, person_projects, wiki_chips_norm):
+def check_project_ownership(person, customer, project_name, chip_candidates, person_projects,
+                            wiki_chips_norm, chip_history=None, chip_history_norm=None):
     chip_codes = [c[0] for c in chip_candidates]
 
     if person in LEADERS_ANY:
@@ -519,6 +593,18 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
         if customer in allowed_customers:
             return True, f'客户 {customer} 匹配', [], allowed_chips, chip_codes
 
+    historical_matches = []
+    if chip_history and chip_history_norm:
+        for cand in chip_candidates:
+            historical = match_chip(cand, chip_history, chip_history_norm)
+            if historical and historical not in historical_matches:
+                historical_matches.append(historical)
+    if historical_matches:
+        return False, (
+            f'识别到历史机芯: {", ".join(historical_matches)}；'
+            f'但不在当前允许范围（允许: {", ".join(allowed)}）'
+        ), [], allowed_chips, chip_codes
+
     return False, f'项目归属待确认（允许: {", ".join(allowed)}）', [], allowed_chips, chip_codes
 
 
@@ -539,15 +625,14 @@ def run_audit(year, month, fetch_result):
     person_projects = mapping_data['person_projects']
     all_people = mapping_data['all_people']
 
+    # 历史机芯只用于识别和解释，不参与当前人员授权判定。
+    chip_history = load_and_update_chip_history(person_projects)
+    chip_history_norm = build_chip_norm(chip_history)
+
     # 构建 Wiki 机芯规范化映射
-    wiki_chips_norm = {}
-    for chip in set(sum([list(v) for v in person_projects.values()], [])):
-        chip_pure = chip.split('/')[-1].strip()
-        if not chip_pure:
-            continue
-        pref, num, suf = chip_normalize(chip_pure)
-        if pref:
-            wiki_chips_norm[chip_pure] = (pref, num, suf)
+    wiki_chips_norm = build_chip_norm(
+        set(sum([list(v) for v in person_projects.values()], []))
+    )
 
     daily_data = fetch_result['daily_data']
     all_users = fetch_result['all_users']
@@ -749,7 +834,7 @@ def run_audit(year, month, fetch_result):
 
                 ok, reason, matched, allowed, chip_codes = check_project_ownership(
                     person, customer_norm, project_name, chip_candidates,
-                    person_projects, wiki_chips_norm)
+                    person_projects, wiki_chips_norm, chip_history, chip_history_norm)
 
                 issue_key = (date_str, person, items, project_name, title)
                 if issue_key in seen_issues:

@@ -35,6 +35,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 ARCHIVE_DIR_NAME = "srdpm_archive"
 DASHBOARD_NAME = "工时审批看板_多月.html"
 MAPPING_NAME = "project_mapping.json"
+CHIP_HISTORY_NAME = "chip_history.json"
 REFRESH_FILE_LOCK_NAME = ".srdpm-refresh.lock"
 REFRESH_MUTEX_NAME = r"Local\SRDPMDashboardRefresh-v1"
 READ_ONLY_FETCH_PATHS = frozenset({"userList", "list", "statistics", "detail"})
@@ -219,6 +220,10 @@ def _copy_stage_snapshot(project_dir: Path, stage_root: Path) -> Path:
     if not mapping_source.is_file():
         raise RefreshError("项目映射文件不存在，未开始刷新")
     shutil.copy2(mapping_source, stage_root / MAPPING_NAME)
+    history_source = project_dir / CHIP_HISTORY_NAME
+    if not history_source.is_file():
+        raise RefreshError("机芯历史库不存在；为避免遗忘旧机芯，未开始刷新")
+    shutil.copy2(history_source, stage_root / CHIP_HISTORY_NAME)
     return stage_archive
 
 
@@ -505,7 +510,10 @@ def refresh_current_month(
                     artifacts = tuple(
                         _Artifact(stage_archive / month / name, target_month_dir / name)
                         for name in REQUIRED_MONTH_ARTIFACTS
-                    ) + (_Artifact(staged_dashboard, resolved_project / DASHBOARD_NAME),)
+                    ) + (
+                        _Artifact(stage_root / CHIP_HISTORY_NAME, resolved_project / CHIP_HISTORY_NAME),
+                        _Artifact(staged_dashboard, resolved_project / DASHBOARD_NAME),
+                    )
                     _publish_staged_artifacts(artifacts, stage_root)
                     return RefreshResult(month=month, published_paths=tuple(a.target for a in artifacts))
         finally:
