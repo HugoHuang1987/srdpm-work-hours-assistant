@@ -739,16 +739,28 @@ class DashboardUiTests(unittest.TestCase):
             self.assertIn(chip, summary_text)
         self.assert_no_page_errors()
 
-    def test_all_months_selector_opens_read_only_aggregate_summary(self):
-        month_keys = self.page.locator("#monthSelector .month-btn").evaluate_all(
-            "buttons => buttons.map(button => button.dataset.month)"
-        )
-        self.assertEqual(month_keys[0], "__all__")
-        self.assertEqual(month_keys[1:], sorted(month_keys[1:]))
-        self.page.locator('.month-btn[data-month="__all__"]').click()
-        self.assertEqual(self.page.evaluate("currentMonth"), "__all__")
+    def test_month_selector_supports_multiple_months_and_select_all(self):
+        month_labels = self.page.locator("#monthSelector .month-menu label:not(.month-all)").all_text_contents()
+        self.assertEqual(len(month_labels), self.page.evaluate("MONTHS.length"))
+        month_menu = self.page.locator("#monthSelector details.month-multi")
+        month_menu.locator("summary").click()
+        self.page.locator("#monthSelector .month-menu label:not(.month-all) input").first.check()
+        self.assertTrue(self.page.locator("#monthSelector details.month-multi").evaluate("element => element.open"))
+        self.assertEqual(self.page.evaluate("selectedMonths.length"), 2)
+        self.page.evaluate("toggleAllMonths(true)")
+        self.assertEqual(self.page.evaluate("selectedMonths"), self.page.evaluate("MONTHS"))
+        self.assertEqual(self.page.evaluate("currentMonth"), "__selection__")
         self.assertTrue(self.page.evaluate("IS_AGGREGATE_VIEW"))
+        self.page.evaluate("selectAllAutoGroups()")
+        self.assertEqual(self.page.evaluate("Object.keys(approvalState).length"), 0)
+        self.assertIsNone(self.page.evaluate("buildSelectedApprovalPlan()"))
+        self.assertTrue(self.page.locator("#btnExecute").is_disabled())
+        self.assertTrue(self.page.locator("#btnConfirm").is_disabled())
+        self.assertFalse(self.page.locator("#btnSelectAllAuto").is_visible())
         self.assertIn("当前筛选范围工时汇总", self.page.locator("#panel_zero .hours-summary").inner_text())
+        self.page.evaluate("applyMonthSelection(MONTHS.slice(0, 2))")
+        self.assertEqual(self.page.evaluate("selectedMonths.length"), 2)
+        self.assertTrue(self.page.evaluate("IS_AGGREGATE_VIEW"))
         self.assert_no_page_errors()
 
     def test_untrusted_archive_values_are_rendered_as_text(self):
