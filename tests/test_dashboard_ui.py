@@ -259,6 +259,7 @@ class DashboardUiTests(unittest.TestCase):
                 };
                 return {
                     month: currentMonth,
+                    display: ALL_DATA[currentMonth].display,
                     manual: countOpen('manual'),
                     auto: countOpen('auto'),
                     platformRows: CAT_DATA.five.items.length,
@@ -273,9 +274,11 @@ class DashboardUiTests(unittest.TestCase):
             f"需人工审核：{expected['manual']['selections']}条选择/{expected['manual']['ids']}个待审ID（已标记0） · "
             f"可审批候选：{expected['auto']['selections']}条选择/{expected['auto']['ids']}个待审ID（已选0）",
         )
-        month_button = self.page.locator(f'.month-btn[data-month="{expected["month"]}"]')
-        self.assertIn(f"{expected['manual']['selections']}人工", month_button.inner_text())
-        self.assertIn(f"{expected['auto']['selections']}候选", month_button.inner_text())
+        self.assertEqual(
+            expected["display"],
+            self.page.locator("#monthSelector details.month-multi summary").inner_text(),
+        )
+        self.assertEqual([expected["month"]], self.page.evaluate("selectedMonths"))
 
         self.page.locator('.cat-nav-item[data-cat="five"]').click()
         platform_status = self.page.locator('.cat-nav-item[data-cat="five"] .cat-status').inner_text()
@@ -295,7 +298,10 @@ class DashboardUiTests(unittest.TestCase):
                     one: {title: '一、漏报人员', items: [{person: 'A'}]},
                     two: {title: '二、请假', items: [{approval_group_key: 'auto-pending'}]},
                     three: {title: '三、工时异常', items: [{approval_group_key: 'manual-pending'}]},
-                    four: {title: '四、项目归属异常', items: [{approval_group_key: 'already-approved'}]},
+                    four: {title: '四、项目归属异常', items: [
+                        {approval_group_key: 'already-approved'},
+                        {status: 'approved', approval_unavailable_reason: 'matched multiple approved rows'}
+                    ]},
                     five: {title: '五、平台类', items: [{approval_group_key: 'selected-pending'}]},
                     six: {title: '六、正常申报', items: [{approval_unavailable_reason: 'cannot match'}]},
                     seven: {title: '七、其他待定', items: [{detail: 'needs review'}]}
@@ -324,6 +330,10 @@ class DashboardUiTests(unittest.TestCase):
                 "node => node.classList.contains('complete')"
             )
         )
+        fourth_status = self.page.locator('.cat-nav-item[data-cat="four"] .cat-status').inner_text()
+        self.assertIn("待处理0", fourth_status)
+        self.assertIn("1条重复明细已通过", fourth_status)
+        self.assertEqual("approved", self.page.evaluate("getStatus('four', 1)"))
         self.assertIn(
             "待处理1条", self.page.locator('.cat-nav-item[data-cat="one"] .cat-status').inner_text()
         )
@@ -342,8 +352,12 @@ class DashboardUiTests(unittest.TestCase):
             }"""
         )
 
-        self.page.locator("#btnRefreshDashboard").click()
-        self.page.wait_for_timeout(1500)
+        with self.page.expect_navigation(wait_until="domcontentloaded", timeout=10_000):
+            self.page.locator("#btnRefreshDashboard").click()
+        self.page.wait_for_function(
+            "document.querySelector('#pendingCount')?.textContent.trim()",
+            timeout=10_000,
+        )
 
         refresh_start = [item for item in requests if item["path"] == "/api/v1/dashboard/refresh"]
         refresh_poll = [
@@ -881,7 +895,9 @@ class DashboardUiTests(unittest.TestCase):
         selected_groups = self.page.evaluate(
             """() => {
                 const groups = Object.values(APPROVAL_GROUPS)
-                    .filter(value => value.review_mode === 'manual').slice(0, 2);
+                    .filter(value =>
+                        value.review_mode === 'manual' && getGroupStatus(value.group_key) !== 'approved'
+                    ).slice(0, 2);
                 for (const group of groups) approvalState[group.group_key] = 'selected';
                 saveState();
                 renderCategoryNav();
@@ -889,6 +905,7 @@ class DashboardUiTests(unittest.TestCase):
                 return groups;
             }"""
         )
+        self.assertEqual(2, len(selected_groups))
         for group in selected_groups:
             row = {
                 "group_key": group["group_key"],

@@ -1162,7 +1162,12 @@ function getGroupStatus(groupKey) {
 function getStatus(catKey, idx) {
     const item = CAT_DATA[catKey].items[idx];
     if (catKey === "one" || catKey === "seven") return "info";
-    return item?.approval_group_key ? getGroupStatus(item.approval_group_key) : "info";
+    if (item?.approval_group_key) return getGroupStatus(item.approval_group_key);
+    // A legacy anomaly may match multiple raw rows and therefore must not get
+    // an approval group.  When every matching raw row is already approved,
+    // preserve that authoritative read-back status in the UI instead of
+    // degrading it to "无法安全定位" merely because no selectable group exists.
+    return item?.status === "approved" ? "approved" : "info";
 }
 
 function setGroupSelected(groupKey, selected) {
@@ -1392,7 +1397,12 @@ function renderCategoryNav() {
             const selected = counts.manual.selected + counts.auto.selected;
             const pending = counts.manual.pending + counts.auto.pending;
             const approved = counts.manual.approved + counts.auto.approved;
-            const unavailable = cat.items.filter(item => item.approval_unavailable_reason).length;
+            const unavailable = cat.items.filter((item, index) =>
+                item.approval_unavailable_reason && getStatus(key, index) !== "approved"
+            ).length;
+            const approvedWithoutGroup = cat.items.filter((item, index) =>
+                !item.approval_group_key && getStatus(key, index) === "approved"
+            ).length;
             const unresolved = pending + selected + unavailable;
             cls = unresolved > 0 ? "attention" : "complete";
             const modeText = manualTotal === 0 && autoTotal === 0
@@ -1401,7 +1411,8 @@ function renderCategoryNav() {
                 ? `人工${manualTotal}条/候选${autoTotal}条`
                 : (manualTotal > 0 ? `人工${manualTotal}条` : `候选${autoTotal}条`));
             statusText = `${modeText} · 待处理${unresolved} · 已选${selected} · 已审批${approved} · ${rowCount}条明细` +
-                (unavailable > 0 ? ` · ${unavailable}条需人工处理` : "");
+                (unavailable > 0 ? ` · ${unavailable}条需人工处理` : "") +
+                (approvedWithoutGroup > 0 ? ` · ${approvedWithoutGroup}条重复明细已通过` : "");
         }
 
         html += `<button class="cat-nav-item ${cls}" data-cat="${key}" onclick="switchTab('${key}')">
