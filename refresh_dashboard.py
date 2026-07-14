@@ -177,6 +177,15 @@ def current_month(now: datetime | None = None) -> tuple[int, int, str]:
     return current.year, current.month, f"{current.year:04d}-{current.month:02d}"
 
 
+def previous_month(year: int, month: int) -> tuple[int, int, str]:
+    """Return the calendar month immediately before ``year``/``month``."""
+    if month == 1:
+        year, month = year - 1, 12
+    else:
+        month -= 1
+    return year, month, f"{year:04d}-{month:02d}"
+
+
 @contextmanager
 def _temporary_module_attributes(module: Any, values: dict[str, Any]) -> Iterator[None]:
     previous = {name: getattr(module, name) for name in values}
@@ -455,6 +464,11 @@ def refresh_current_month(
     if not resolved_project.is_dir():
         raise RefreshError("项目目录不存在，未开始刷新")
     year, month_number, month = current_month(now)
+    previous_year, previous_month_number, previous_month_label = previous_month(year, month_number)
+    refresh_months = (
+        (previous_year, previous_month_number, previous_month_label),
+        (year, month_number, month),
+    )
 
     try:
         lock = lock_factory()
@@ -491,6 +505,15 @@ def refresh_current_month(
                             fetch_module=fetch_module,
                             stage_root=stage_root,
                             stage_archive=stage_archive,
+                            year=previous_year,
+                            month=previous_month_number,
+                            credentials=credentials,
+                        )
+                        _validate_staged_month(stage_archive, previous_month_label)
+                        _run_staged_fetch_and_audit(
+                            fetch_module=fetch_module,
+                            stage_root=stage_root,
+                            stage_archive=stage_archive,
                             year=year,
                             month=month_number,
                             credentials=credentials,
@@ -506,11 +529,14 @@ def refresh_current_month(
                     except Exception as exc:
                         raise RefreshError("抓取、审计或看板生成失败，旧数据未修改") from exc
 
-                    target_month_dir = resolved_project / ARCHIVE_DIR_NAME / month
-                    artifacts = tuple(
-                        _Artifact(stage_archive / month / name, target_month_dir / name)
-                        for name in REQUIRED_MONTH_ARTIFACTS
-                    ) + (
+                    month_artifacts = []
+                    for _year, _month_number, month_label in refresh_months:
+                        target_month_dir = resolved_project / ARCHIVE_DIR_NAME / month_label
+                        month_artifacts.extend(
+                            _Artifact(stage_archive / month_label / name, target_month_dir / name)
+                            for name in REQUIRED_MONTH_ARTIFACTS
+                        )
+                    artifacts = tuple(month_artifacts) + (
                         _Artifact(stage_root / CHIP_HISTORY_NAME, resolved_project / CHIP_HISTORY_NAME),
                         _Artifact(staged_dashboard, resolved_project / DASHBOARD_NAME),
                     )

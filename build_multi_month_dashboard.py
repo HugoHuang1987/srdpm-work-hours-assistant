@@ -1012,7 +1012,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
             <h1>📋 SRDPM 工时审批看板</h1>
             <div class="meta" id="headerMeta">加载中...</div>
         </div>
-        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()" title="只从 SRDPM 读取当前自然月；历史月份沿用本地归档">↻ 重新读取当前月（不重拉历史）</button>
+        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()" title="只从 SRDPM 读取当前自然月和前一个自然月；更早月份沿用本地归档">↻ 重新读取当前月+前一月</button>
     </div>
 </div>
 

@@ -212,10 +212,13 @@ class RefreshDashboardTests(unittest.TestCase):
             result = self._refresh()
 
         self.assertEqual(self.month, result.month)
-        self.assertEqual(5, len(result.published_paths))
-        self.assertEqual([("offline-user", "offline-password")], self.fetch.login_inputs)
-        self.assertEqual(1, len(self.fetch.fetch_inputs))
-        self.assertEqual(1, len(self.fetch.audit_inputs))
+        self.assertEqual(8, len(result.published_paths))
+        self.assertEqual(
+            [("offline-user", "offline-password"), ("offline-user", "offline-password")],
+            self.fetch.login_inputs,
+        )
+        self.assertEqual(2, len(self.fetch.fetch_inputs))
+        self.assertEqual(2, len(self.fetch.audit_inputs))
         self.assertTrue(self.fetch.session.closed)
         self.assertEqual("original-out", self.fetch.OUT_DIR)
         self.assertEqual("original-archive", self.fetch.ARCHIVE_DIR)
@@ -228,6 +231,9 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("credentials", True),
+                ("login", True),
+                ("fetch", True),
+                ("audit", True),
                 ("login", True),
                 ("fetch", True),
                 ("audit", True),
