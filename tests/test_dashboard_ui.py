@@ -342,6 +342,52 @@ class DashboardUiTests(unittest.TestCase):
         )
         self.assert_no_page_errors()
 
+    def test_pending_only_filter_is_available_for_categories_two_to_seven(self):
+        self.page.evaluate(
+            """() => {
+                CAT_DATA = {
+                    two: {title: '二、请假', items: [
+                        {date: '2026-07-01', person: '待处理', project: 'P1', title: '请假', content: '', hours: 1, approval_group_key: 'pending-auto'},
+                        {date: '2026-07-02', person: '已审批', project: 'P2', title: '请假', content: '', hours: 1, approval_group_key: 'approved-auto'}
+                    ]},
+                    three: {title: '三、工时异常', items: [
+                        {date: '2026-07-01', person: '待处理', subtype: '低申报', reported: 1, checked: 2, leave: 0, effective: 1, ratio: '50%', detail: '', approval_group_key: 'pending-manual'},
+                        {date: '2026-07-02', person: '已审批', subtype: '低申报', reported: 1, checked: 2, leave: 0, effective: 1, ratio: '50%', detail: '', approval_group_key: 'approved-manual'}
+                    ]},
+                    four: {title: '四、项目归属异常', items: [
+                        {date: '2026-07-01', person: '待处理', customer: '', items: 'P1', title: '', content: '', hours: 1, chip: 'MT1', allowed: 'MT1', reason: '', approval_group_key: 'pending-manual'},
+                        {date: '2026-07-02', person: '已审批', customer: '', items: 'P2', title: '', content: '', hours: 1, chip: 'MT2', allowed: 'MT2', reason: '', approval_group_key: 'approved-manual'}
+                    ]},
+                    five: {title: '五、公共事务/平台类', items: [
+                        {date: '2026-07-01', person: '待处理', project: 'P1', title: '', content: '', hours: 1, approval_group_key: 'pending-auto'},
+                        {date: '2026-07-02', person: '已审批', project: 'P2', title: '', content: '', hours: 1, approval_group_key: 'approved-auto'}
+                    ]},
+                    six: {title: '六、正常申报', items: [
+                        {date: '2026-07-01', person: '待处理', project: 'P1', chip: 'MT1', title: '', content: '', hours: 1, approval_group_key: 'pending-auto'},
+                        {date: '2026-07-02', person: '已审批', project: 'P2', chip: 'MT2', title: '', content: '', hours: 1, approval_group_key: 'approved-auto'}
+                    ]},
+                    seven: {title: '七、其他待定', items: [
+                        {date: '2026-07-01', person: '待处理', detail: '需核对'},
+                        {date: '2026-07-02', person: '已审批', detail: '信息行', status: 'approved'}
+                    ]}
+                };
+                APPROVAL_GROUPS = {
+                    'pending-auto': {group_key: 'pending-auto', review_mode: 'auto', approve_ids: ['a']},
+                    'approved-auto': {group_key: 'approved-auto', review_mode: 'auto', approve_ids: ['b'], status: 'approved'},
+                    'pending-manual': {group_key: 'pending-manual', review_mode: 'manual', approve_ids: ['c']},
+                    'approved-manual': {group_key: 'approved-manual', review_mode: 'manual', approve_ids: ['d'], status: 'approved'}
+                };
+                approvalState = {};
+                resetAllPageState();
+            }"""
+        )
+        for key in ("two", "three", "four", "five", "six", "seven"):
+            self.page.evaluate("key => switchTab(key)", key)
+            self.page.locator(f"#pendingOnly_{key}").check()
+            expected_visible = 2 if key == "seven" else 1
+            self.assertEqual(expected_visible, self.page.locator(f"#panel_{key} .table-wrap tbody tr:visible").count(), key)
+        self.assert_no_page_errors()
+
     def test_ui_refresh_uses_read_only_endpoint_and_clears_updated_month_selection(self):
         requests, _ = self.open_mock_local_service(lambda: {})
         group_key = self.page.evaluate(

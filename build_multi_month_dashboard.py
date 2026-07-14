@@ -1437,6 +1437,7 @@ function switchTab(key) {
 const PAGE_SIZES = [10, 20, 50, 100];
 // 对大数据量分类（four=项目归属异常、six=正常申报）启用分页
 const PAGINATED_CATS = ["four", "six"];
+const PENDING_FILTER_CATS = ["two", "three", "four", "five", "six", "seven"];
 let pageState = {};  // { catKey: { pageSize: 20, currentPage: 0, filteredIndices: [0,1,2,...] } }
 let filterState0 = {persons: [], chips: []};
 let filterState6 = {persons: [], chips: [], search: ""};
@@ -1462,7 +1463,11 @@ function getFilteredIndices(key) {
 
 function renderBulkActions(key) {
     if (IS_AGGREGATE_VIEW) return "";
-    if (!APPROVE_CATS.includes(key)) return "";
+    if (!APPROVE_CATS.includes(key) && !PENDING_FILTER_CATS.includes(key)) return "";
+    const pendingFilter = PENDING_FILTER_CATS.includes(key)
+        ? `<label class="pending-only-toggle"><input id="pendingOnly_${key}" type="checkbox" ${pageState[key]?.pendingOnly ? "checked" : ""} onchange="togglePendingOnly('${key}', this.checked)">只看待处理</label>`
+        : "";
+    if (!APPROVE_CATS.includes(key)) return `<div class="bulk-actions">${pendingFilter}</div>`;
     const allViewGroupKeys = groupKeysForCategory(key, false);
     const viewCounts = deriveCounts(allViewGroupKeys);
     const hasAutoPending = viewCounts.auto.pending > 0;
@@ -1473,7 +1478,7 @@ function renderBulkActions(key) {
         const group = APPROVAL_GROUPS[groupKey];
         return group?.review_mode === "manual" && group.primary_category !== key;
     }).length;
-    let html = '<div class="bulk-actions">';
+    let html = `<div class="bulk-actions">${pendingFilter}`;
     if (hasAutoPending) {
         html += `<button class="btn-info" onclick="selectCategoryGroups('${key}', 'auto', true)">⭐ 全选本类候选（${viewCounts.auto.pending}条）</button>`;
     }
@@ -1534,6 +1539,7 @@ function renderPanel(key) {
 
     let html = `<div class="panel active" id="panel_${key}">`;
     html += `<div class="panel-desc">${escapeHtml(cat.desc || cat.subtitle || "")}</div>`;
+    if (key !== "zero") html += renderBulkActions(key);
 
     if (cat.items.length === 0) {
         const emoji = cat.approval_candidate ? "✅" : "📭";
@@ -1544,7 +1550,6 @@ function renderPanel(key) {
         if (key === "zero") {
             html += renderSummaryZero(cat);
         } else {
-            html += renderBulkActions(key);
             html += renderTable(key, cat);
         }
     }
@@ -1689,7 +1694,8 @@ function renderTable(key, cat) {
     for (const i of indicesToRender) {
         const item = items[i];
         const status = getStatus(key, i);
-        tableHtml += `<tr id="row_${key}_${i}">`;
+        const hiddenByPending = pageState[key]?.pendingOnly && status === "approved";
+        tableHtml += `<tr id="row_${key}_${i}"${hiddenByPending ? ' style="display:none;"' : ""}>`;
 
         for (const col of cols) {
             if (col === "status") {
@@ -1828,6 +1834,17 @@ function changePageSize(key, size) {
     if (!ps) return;
     ps.pageSize = parseInt(size);
     ps.currentPage = 0;  // 切换页大小时回到第一页
+    renderPanel(key);
+}
+
+function togglePendingOnly(key, checked) {
+    if (!PENDING_FILTER_CATS.includes(key) || approvalExecutionActive || IS_AGGREGATE_VIEW) return;
+    initPageState(key, CAT_DATA[key]?.items || []);
+    pageState[key].pendingOnly = Boolean(checked);
+    if (key === "three") return refilterThree();
+    if (key === "five") return refilterFive();
+    if (key === "four") return refilterFour();
+    if (key === "six") return refilterSix();
     renderPanel(key);
 }
 
@@ -2380,7 +2397,9 @@ function refilterThree() {
         if (cells.length < 3) return;
         const rowSubtype = cells[2]?.textContent || "";
         const rowPerson = cells[1]?.textContent || "";
-        const match = (subtype === "all" || rowSubtype.includes(subtype)) && (person === "all" || rowPerson.includes(person));
+        const rowIndex = Number(row.id.split("_").pop());
+        const pendingMatch = !pageState.three?.pendingOnly || getStatus("three", rowIndex) !== "approved";
+        const match = pendingMatch && (subtype === "all" || rowSubtype.includes(subtype)) && (person === "all" || rowPerson.includes(person));
         row.style.display = match ? "" : "none";
         if (match) count++;
     });
@@ -2398,7 +2417,9 @@ function refilterFive() {
         if (cells.length < 3) return;
         const rowPerson = cells[1]?.textContent || "";
         const rowText = row.textContent.toLowerCase();
-        const match = (person === "all" || rowPerson.includes(person)) && (!search || rowText.includes(search));
+        const rowIndex = Number(row.id.split("_").pop());
+        const pendingMatch = !pageState.five?.pendingOnly || getStatus("five", rowIndex) !== "approved";
+        const match = pendingMatch && (person === "all" || rowPerson.includes(person)) && (!search || rowText.includes(search));
         row.style.display = match ? "" : "none";
         if (match) count++;
     });
@@ -2503,6 +2524,17 @@ function sortCategory(key, sortValue) {
     renderPanel(key);
 }
 
+function refilterFour() {
+    const cat = CAT_DATA["four"];
+    initPageState("four", cat.items);
+    const ps = pageState.four;
+    ps.filteredIndices = cat.items
+        .map((_, index) => index)
+        .filter(index => !ps.pendingOnly || getStatus("four", index) !== "approved");
+    ps.currentPage = 0;
+    if (ps.sort) sortCategory("four", ps.sort); else renderPanel("four");
+}
+
 function refilterSix() {
     const cat = CAT_DATA["six"];
     const persons = new Set(filterState6.persons);
@@ -2512,7 +2544,8 @@ function refilterSix() {
     const filtered = [];
     for (let i = 0; i < cat.items.length; i++) {
         const item = cat.items[i];
-        const match = (persons.size === 0 || persons.has(item.person)) &&
+        const match = (!pageState.six?.pendingOnly || getStatus("six", i) !== "approved") &&
+            (persons.size === 0 || persons.has(item.person)) &&
             (chips.size === 0 || chips.has(item.chip)) &&
             (!search || (item.title + item.content + item.project + (item.chip || "") + item.date + item.person).toLowerCase().includes(search));
         if (match) filtered.push(i);
