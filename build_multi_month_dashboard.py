@@ -1277,7 +1277,7 @@ let pageState = {};  // { catKey: { pageSize: 20, currentPage: 0, filteredIndice
 function initPageState(key, items) {
     const indices = items.map((_, i) => i);
     if (!pageState[key]) {
-        pageState[key] = { pageSize: 20, currentPage: 0, filteredIndices: indices };
+        pageState[key] = { pageSize: 20, currentPage: 0, filteredIndices: indices, sort: "" };
     }
     // 已存在时保持当前分页状态（切换标签页/审核按钮时不应重置）
 }
@@ -1455,6 +1455,32 @@ function renderTable(key, cat) {
             <span class="filter-count" id="filterCount6"></span>
         </div>`;
     }
+    if (key === "four") {
+        filterHtml = `<div class="filter-row">
+            <label>排序：</label>
+            <select id="sort_four" onchange="sortCategory('four', this.value)">
+                <option value="">默认顺序</option>
+                <option value="date_asc">按日期升序</option>
+                <option value="date_desc">按日期降序</option>
+                <option value="project_asc">按项目升序</option>
+                <option value="project_desc">按项目降序</option>
+                <option value="chip_asc">按机芯升序</option>
+                <option value="chip_desc">按机芯降序</option>
+            </select>
+        </div>`;
+    }
+    if (key === "six") {
+        filterHtml += `<label>排序：</label>
+            <select id="sort_six" onchange="sortCategory('six', this.value)">
+                <option value="">默认顺序</option>
+                <option value="date_asc">按日期升序</option>
+                <option value="date_desc">按日期降序</option>
+                <option value="project_asc">按项目升序</option>
+                <option value="project_desc">按项目降序</option>
+                <option value="chip_asc">按机芯升序</option>
+                <option value="chip_desc">按机芯降序</option>
+            </select>`;
+    }
 
     // 决定渲染哪些行：分页分类只渲染当前页，其他分类渲染全部
     const isPaginated = PAGINATED_CATS.includes(key);
@@ -1465,7 +1491,7 @@ function renderTable(key, cat) {
         const end = Math.min(start + ps.pageSize, ps.filteredIndices.length);
         indicesToRender = ps.filteredIndices.slice(start, end);
     } else {
-        indicesToRender = items.map((_, i) => i);
+        indicesToRender = getFilteredIndices(key);
     }
 
     let tableHtml = filterHtml;
@@ -2183,6 +2209,29 @@ function refilterFive() {
     if (el) el.textContent = `显示 ${count} 条`;
 }
 
+function sortCategory(key, sortValue) {
+    const cat = CAT_DATA[key];
+    if (!cat) return;
+    initPageState(key, cat.items);
+    const ps = pageState[key];
+    const currentIndices = ps.filteredIndices.slice();
+    ps.sort = sortValue || "";
+    const [field, direction] = (sortValue || "").split("_");
+    if (!field) {
+        ps.filteredIndices = currentIndices;
+    } else {
+        ps.filteredIndices = currentIndices.sort((a, b) => {
+            const actualField = field === "project" && key === "four" ? "items" : field;
+            const av = String(cat.items[a]?.[actualField] ?? "");
+            const bv = String(cat.items[b]?.[actualField] ?? "");
+            const result = field === "date" ? av.localeCompare(bv) : av.localeCompare(bv, "zh-CN", {numeric: true, sensitivity: "base"});
+            return direction === "desc" ? -result : result;
+        });
+    }
+    ps.currentPage = 0;
+    renderPanel(key);
+}
+
 function refilterSix() {
     const cat = CAT_DATA["six"];
     const person = document.getElementById("filter_person6")?.value || "all";
@@ -2199,6 +2248,7 @@ function refilterSix() {
     }
     // 更新分页状态的过滤索引
     pageState["six"].filteredIndices = filtered;
+    if (pageState["six"].sort) sortCategory("six", pageState["six"].sort);
     pageState["six"].currentPage = 0;  // 过滤后回到第一页
     // 更新计数显示
     const el = document.getElementById("filterCount6");
