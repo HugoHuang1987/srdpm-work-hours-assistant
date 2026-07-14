@@ -472,6 +472,60 @@ def build_category_data(data, md_text, raw_data=None):
         "suggest_approve": True
     }
 
+    # 0、汇总信息：直接从原始明细重建，避免三（整日异常）与四/六（明细）重复累计。
+    leave_ids = {
+        approve_id
+        for item in cats["two"]["items"]
+        for approve_id in normalize_approve_ids(item.get("approve_ids", "").split(","))
+    }
+    summary_items = []
+    summary_seen = set()
+    for record in raw_children:
+        child = record["child"]
+        approve_id = str(record.get("approve_id") or "").strip()
+        fallback_key = (
+            record["date"], record["person"], child.get("items", ""),
+            child.get("title", ""), child.get("content", ""), child.get("work_hours", 0),
+        )
+        unique_key = ("id", approve_id) if approve_id else ("row", fallback_key)
+        if unique_key in summary_seen:
+            continue
+        summary_seen.add(unique_key)
+
+        items_code = child.get("items", "") or ""
+        rec_type = child.get("type", "") or ""
+        if approve_id and approve_id in leave_ids:
+            bucket = "请假/出差/休假"
+        elif (rec_type in {"纯平台类", "客户平台类"} or
+              items_code.startswith("YF-CP") or items_code.startswith("YF-SW")):
+            bucket = "公共事务/平台"
+        else:
+            project_name = child.get("project_name", "") or ""
+            chip_match = re.search(r'\d((?:MT|AM)\d{3,4}[A-Z0-9]*)', str(project_name))
+            if chip_match:
+                chip_code = chip_match.group(1)
+                chip_prefix = re.match(r'(?:MT|AM)\d{3,4}', chip_code)
+                bucket = chip_prefix.group(0) if chip_prefix else chip_code
+            else:
+                bucket = "未识别机芯"
+        summary_items.append({
+            "date": record["date"],
+            "person": record["person"],
+            "chip": bucket,
+            "project": items_code,
+            "title": child.get("title", "") or "",
+            "content": (child.get("content", "") or "").strip(),
+            "hours": float(child.get("work_hours", 0) or 0),
+        })
+
+    cats["zero"] = {
+        "title": "0、汇总信息",
+        "desc": "覆盖二至七项；项目工时按机芯合并，平台和请假类单独列示",
+        "items": summary_items,
+        "approval_candidate": False,
+        "no_approval": True,
+    }
+
     return cats
 
 
@@ -1039,7 +1093,7 @@ function escapeHtml(value) {
 let currentMonth = MONTHS[0]; // 默认选最新月
 let CAT_DATA = {};
 let APPROVAL_GROUPS = {};
-let currentCatKey = "one";
+let currentCatKey = "zero";
 
 // localStorage 只保存“已选择”；已审批只来自归档或本次服务端回读结果。
 // 服务端每次仍从归档重建白名单并实时复检，不信任浏览器状态。
@@ -1118,8 +1172,8 @@ function deriveCounts(groupKeys = Object.keys(APPROVAL_GROUPS)) {
 const CANDIDATE_CATS = ["two", "five", "six"];
 const MANUAL_APPROVE_CATS = ["three", "four"];
 const APPROVE_CATS = ["two", "three", "four", "five", "six"];
-const NO_APPROVE_CATS = ["one", "seven"];        // 无审批按钮的分类（漏报、其他待定）
-const ALL_CATS = ["one", "two", "three", "four", "five", "six", "seven"];
+const NO_APPROVE_CATS = ["zero", "one", "seven"];        // 无审批按钮的分类（汇总、漏报、其他待定）
+const ALL_CATS = ["zero", "one", "two", "three", "four", "five", "six", "seven"];
 
 function init() {
     updateLocalServiceStatus();
@@ -1211,7 +1265,7 @@ function switchMonth(ml) {
     loadState(ml);
     sanitizeState();
     resetAllPageState();
-    currentCatKey = "one";
+    currentCatKey = "zero";
 
     // Update month selector
     document.querySelectorAll(".month-btn").forEach(b => {
@@ -1225,7 +1279,7 @@ function switchMonth(ml) {
         `当前查看：${display} · 数据拉取：${fetchTime || '未知'} · 审批数据存档不变`;
 
     renderCategoryNav();
-    switchTab("one");
+    switchTab("zero");
     updatePendingCount();
     updateStats(ml);
 }
@@ -1235,10 +1289,14 @@ function renderCategoryNav() {
     let html = "";
     for (const key of ALL_CATS) {
         const cat = CAT_DATA[key];
+        if (!cat) continue;
         const rowCount = cat.items.length;
         let cls = "complete";
         let statusText;
-        if (NO_APPROVE_CATS.includes(key)) {
+        if (key === "zero") {
+            cls = "complete";
+            statusText = `${rowCount}条原始明细 · 工时汇总`;
+        } else if (NO_APPROVE_CATS.includes(key)) {
             const pending = rowCount;
             cls = pending > 0 ? "attention" : "complete";
             statusText = pending > 0
@@ -1290,6 +1348,7 @@ const PAGE_SIZES = [10, 20, 50, 100];
 // 只对大数据量分类（six=正常申报）启用分页，其他分类数据量小无需分页
 const PAGINATED_CATS = ["six"];
 let pageState = {};  // { catKey: { pageSize: 20, currentPage: 0, filteredIndices: [0,1,2,...] } }
+let filterState0 = {persons: [], chips: []};
 let filterState6 = {persons: [], chips: [], search: ""};
 
 function initPageState(key, items) {
@@ -1303,6 +1362,7 @@ function initPageState(key, items) {
 // 切换月份时重置所有分页状态
 function resetAllPageState() {
     pageState = {};
+    filterState0 = {persons: [], chips: []};
     filterState6 = {persons: [], chips: [], search: ""};
 }
 
@@ -1390,11 +1450,36 @@ function renderPanel(key) {
     } else {
         // 初始化分页状态
         initPageState(key, cat.items);
-        html += renderBulkActions(key);
-        html += renderTable(key, cat);
+        if (key === "zero") {
+            html += renderSummaryZero(cat);
+        } else {
+            html += renderBulkActions(key);
+            html += renderTable(key, cat);
+        }
     }
     html += "</div>";
     area.innerHTML = html;
+}
+
+function renderSummaryZero(cat) {
+    const items = cat.items;
+    const persons = [...new Set(items.map(item => item.person))].sort();
+    const chips = [...new Set(items.map(item => item.chip).filter(Boolean))].sort();
+    const selectedPersons = new Set(filterState0.persons);
+    const selectedChips = new Set(filterState0.chips);
+    const personLabel = selectedPersons.size ? `已选 ${selectedPersons.size} 人` : "全部人员";
+    const chipLabel = selectedChips.size ? `已选 ${selectedChips.size} 列` : "全部分类/机芯";
+    return `<div class="six-tools-row"><div class="six-filter-box">
+        <label>人员：</label>
+        <details class="multi-filter"><summary>${personLabel}</summary><div class="multi-filter-menu">
+            ${persons.map(person => `<label><input type="checkbox" ${selectedPersons.has(person) ? "checked" : ""} onchange="toggleMultiFilter0('persons', '${encodeURIComponent(person)}', this.checked)">${escapeHtml(person)}</label>`).join('')}
+        </div></details>
+        <label>分类/机芯：</label>
+        <details class="multi-filter"><summary>${chipLabel}</summary><div class="multi-filter-menu">
+            ${chips.map(chip => `<label><input type="checkbox" ${selectedChips.has(chip) ? "checked" : ""} onchange="toggleMultiFilter0('chips', '${encodeURIComponent(chip)}', this.checked)">${escapeHtml(chip)}</label>`).join('')}
+        </div></details>
+        <span class="filter-count">纳入 ${getFilteredIndices("zero").length} 条明细</span>
+    </div>${renderHoursSummary6(items, getFilteredIndices("zero"))}</div>`;
 }
 
 function renderTable(key, cat) {
@@ -2253,6 +2338,28 @@ function toggleMultiFilter6(type, encodedValue, checked) {
     if (checked) selected.add(value); else selected.delete(value);
     filterState6[type] = [...selected];
     refilterSix();
+}
+
+function toggleMultiFilter0(type, encodedValue, checked) {
+    const value = decodeURIComponent(encodedValue);
+    const selected = new Set(filterState0[type]);
+    if (checked) selected.add(value); else selected.delete(value);
+    filterState0[type] = [...selected];
+    refilterZero();
+}
+
+function refilterZero() {
+    const cat = CAT_DATA["zero"];
+    const persons = new Set(filterState0.persons);
+    const chips = new Set(filterState0.chips);
+    pageState["zero"].filteredIndices = cat.items
+        .map((item, index) => ({item, index}))
+        .filter(({item}) =>
+            (persons.size === 0 || persons.has(item.person)) &&
+            (chips.size === 0 || chips.has(item.chip))
+        )
+        .map(({index}) => index);
+    renderPanel("zero");
 }
 
 function updateSearch6(value) {

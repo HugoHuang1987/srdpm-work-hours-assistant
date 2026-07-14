@@ -179,6 +179,21 @@ class CurrentArchiveRegressionTests(unittest.TestCase):
         }
         self.assertEqual(set(groups), represented)
 
+    def test_summary_category_counts_each_raw_detail_once(self):
+        raw, cats, _ = self.load_month("2026-07")
+        unique_children = list(iter_unique_children(raw))
+        summary_rows = cats["zero"]["items"]
+        self.assertEqual(len(unique_children), len(summary_rows))
+        raw_hours = sum(
+            float(record["child"].get("work_hours", 0) or 0)
+            for record in unique_children
+        )
+        summary_hours = sum(float(item.get("hours", 0) or 0) for item in summary_rows)
+        self.assertAlmostEqual(raw_hours, summary_hours, places=6)
+        buckets = {item["chip"] for item in summary_rows}
+        self.assertIn("公共事务/平台", buckets)
+        self.assertIn("请假/出差/休假", buckets)
+
 
 if __name__ == "__main__":
     unittest.main()

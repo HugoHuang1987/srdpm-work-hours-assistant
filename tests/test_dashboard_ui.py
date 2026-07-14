@@ -703,6 +703,42 @@ class DashboardUiTests(unittest.TestCase):
         )
         self.assert_no_page_errors()
 
+    def test_summary_category_precedes_one_and_filters_all_source_buckets(self):
+        nav_keys = self.page.locator("#categoryNav .cat-nav-item").evaluate_all(
+            "buttons => buttons.map(button => button.dataset.cat)"
+        )
+        self.assertEqual(nav_keys[:2], ["zero", "one"])
+        self.page.locator('.cat-nav-item[data-cat="zero"]').click()
+        expected = self.page.evaluate(
+            """() => {
+                const chips = ['请假/出差/休假', '公共事务/平台'].filter(chip =>
+                    CAT_DATA.zero.items.some(item => item.chip === chip)
+                );
+                const persons = [...new Set(chips.map(chip =>
+                    CAT_DATA.zero.items.find(item => item.chip === chip)?.person
+                ).filter(Boolean))];
+                filterState0.persons = persons;
+                filterState0.chips = chips;
+                refilterZero();
+                const rows = CAT_DATA.zero.items.filter(item =>
+                    persons.includes(item.person) && chips.includes(item.chip)
+                );
+                return {persons, chips, count: rows.length};
+            }"""
+        )
+        self.assertEqual(
+            self.page.locator("#panel_zero .multi-filter input:checked").count(),
+            len(expected["persons"]) + len(expected["chips"]),
+        )
+        self.assertIn(
+            f"纳入 {expected['count']} 条明细",
+            self.page.locator("#panel_zero .filter-count").inner_text(),
+        )
+        summary_text = self.page.locator("#panel_zero .hours-summary").inner_text()
+        for chip in expected["chips"]:
+            self.assertIn(chip, summary_text)
+        self.assert_no_page_errors()
+
     def test_untrusted_archive_values_are_rendered_as_text(self):
         attack = '</script><img data-xss="1" src=x onerror="window.__xss=1">&"'
         self.page.evaluate(
