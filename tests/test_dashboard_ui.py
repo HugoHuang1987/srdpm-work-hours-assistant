@@ -661,6 +661,48 @@ class DashboardUiTests(unittest.TestCase):
         )
         self.assert_no_page_errors()
 
+    def test_normal_items_support_multi_filter_and_filtered_hours_summary(self):
+        self.page.locator('.cat-nav-item[data-cat="six"]').click()
+        expected = self.page.evaluate(
+            """() => {
+                const rows = CAT_DATA.six.items.filter(item => item.chip);
+                const persons = [...new Set(rows.map(item => item.person))].slice(0, 2);
+                const chips = [...new Set(rows.filter(item => persons.includes(item.person)).map(item => item.chip))].slice(0, 2);
+                filterState6.persons = persons;
+                filterState6.chips = chips;
+                filterState6.search = '';
+                refilterSix();
+                const filtered = CAT_DATA.six.items.filter(item =>
+                    persons.includes(item.person) && chips.includes(item.chip)
+                );
+                return {
+                    persons,
+                    chips,
+                    count: filtered.length,
+                    total: filtered.reduce((sum, item) => sum + (Number(item.hours) || 0), 0),
+                };
+            }"""
+        )
+        self.assertGreaterEqual(len(expected["persons"]), 1)
+        self.assertGreaterEqual(len(expected["chips"]), 1)
+        self.assertEqual(
+            self.page.locator("#panel_six .multi-filter input:checked").count(),
+            len(expected["persons"]) + len(expected["chips"]),
+        )
+        self.assertIn(
+            f"显示 {expected['count']} 条",
+            self.page.locator("#panel_six #filterCount6").inner_text(),
+        )
+        summary_text = self.page.locator("#panel_six .hours-summary").inner_text()
+        self.assertIn("当前筛选范围工时汇总", summary_text)
+        self.assertIn("机芯合计", summary_text)
+        self.assertIn("人员合计", summary_text)
+        self.assertIn(
+            self.page.evaluate("value => formatHours(value)", expected["total"]),
+            summary_text,
+        )
+        self.assert_no_page_errors()
+
     def test_untrusted_archive_values_are_rendered_as_text(self):
         attack = '</script><img data-xss="1" src=x onerror="window.__xss=1">&"'
         self.page.evaluate(

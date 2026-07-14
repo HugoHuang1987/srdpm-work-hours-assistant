@@ -855,6 +855,21 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .filter-row input, .filter-row select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
 .filter-row label { font-size: 13px; color: #666; font-weight: 500; }
 .filter-count { font-size: 13px; color: #888; margin-left: auto; }
+.six-tools-row { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(520px, 1.5fr); gap: 18px; align-items: start; margin-bottom: 12px; }
+.six-filter-box { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.multi-filter { position: relative; }
+.multi-filter summary { list-style: none; min-width: 110px; padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; cursor: pointer; font-size: 13px; }
+.multi-filter summary::-webkit-details-marker { display: none; }
+.multi-filter-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 180px; max-height: 260px; overflow: auto; padding: 8px; background: #fff; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 8px 22px rgba(0,0,0,.15); }
+.multi-filter-menu label { display: block; padding: 5px 6px; white-space: nowrap; cursor: pointer; }
+.multi-filter-menu input { margin-right: 7px; }
+.hours-summary { border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 260px; }
+.hours-summary h4 { position: sticky; left: 0; margin: 0; padding: 9px 12px; background: #f5f7fb; color: #334; font-size: 14px; }
+.hours-summary table { font-size: 12px; }
+.hours-summary th, .hours-summary td { padding: 6px 9px; text-align: right; }
+.hours-summary th:first-child, .hours-summary td:first-child { position: sticky; left: 0; text-align: left; background: #fff; }
+.hours-summary thead th:first-child { background: #fafafa; }
+@media (max-width: 1100px) { .six-tools-row { grid-template-columns: 1fr; } }
 
 /* 增强统计区域 */
 .stats-section { border-top: 4px solid #6c5ce7; margin-top: 30px; padding-top: 20px; }
@@ -1275,6 +1290,7 @@ const PAGE_SIZES = [10, 20, 50, 100];
 // 只对大数据量分类（six=正常申报）启用分页，其他分类数据量小无需分页
 const PAGINATED_CATS = ["six"];
 let pageState = {};  // { catKey: { pageSize: 20, currentPage: 0, filteredIndices: [0,1,2,...] } }
+let filterState6 = {persons: [], chips: [], search: ""};
 
 function initPageState(key, items) {
     const indices = items.map((_, i) => i);
@@ -1287,6 +1303,7 @@ function initPageState(key, items) {
 // 切换月份时重置所有分页状态
 function resetAllPageState() {
     pageState = {};
+    filterState6 = {persons: [], chips: [], search: ""};
 }
 
 function getFilteredIndices(key) {
@@ -1442,20 +1459,22 @@ function renderTable(key, cat) {
     if (key === "six") {
         const persons6 = [...new Set(items.map(i => i.person))].sort();
         const chips6 = [...new Set(items.map(i => i.chip).filter(Boolean))].sort();
-        filterHtml = `<div class="filter-row">
+        const selectedPersons = new Set(filterState6.persons);
+        const selectedChips = new Set(filterState6.chips);
+        const personLabel = selectedPersons.size ? `已选 ${selectedPersons.size} 人` : "全部人员";
+        const chipLabel = selectedChips.size ? `已选 ${selectedChips.size} 个机芯` : "全部机芯";
+        filterHtml = `<div class="six-tools-row"><div class="six-filter-box">
             <label>人员：</label>
-            <select id="filter_person6" onchange="refilterSix()">
-                <option value="all">全部</option>
-                ${persons6.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('')}
-            </select>
+            <details class="multi-filter"><summary>${personLabel}</summary><div class="multi-filter-menu">
+                ${persons6.map(p => `<label><input type="checkbox" ${selectedPersons.has(p) ? "checked" : ""} onchange="toggleMultiFilter6('persons', '${encodeURIComponent(p)}', this.checked)">${escapeHtml(p)}</label>`).join('')}
+            </div></details>
             <label>机芯：</label>
-            <select id="filter_chip6" onchange="refilterSix()">
-                <option value="all">全部</option>
-                ${chips6.map(chip => `<option value="${escapeHtml(chip)}">${escapeHtml(chip)}</option>`).join('')}
-            </select>
-            <input type="text" id="search6" placeholder="搜索内容..." oninput="refilterSix()" style="width:200px;">
-            <span class="filter-count" id="filterCount6"></span>
-        </div>`;
+            <details class="multi-filter"><summary>${chipLabel}</summary><div class="multi-filter-menu">
+                ${chips6.map(chip => `<label><input type="checkbox" ${selectedChips.has(chip) ? "checked" : ""} onchange="toggleMultiFilter6('chips', '${encodeURIComponent(chip)}', this.checked)">${escapeHtml(chip)}</label>`).join('')}
+            </div></details>
+            <input type="text" id="search6" value="${escapeHtml(filterState6.search)}" placeholder="搜索内容..." onchange="updateSearch6(this.value)" style="width:200px;">
+            <span class="filter-count" id="filterCount6">显示 ${getFilteredIndices("six").length} 条</span>
+        </div>${renderHoursSummary6(items, getFilteredIndices("six"))}</div>`;
     }
     // 决定渲染哪些行：分页分类只渲染当前页，其他分类渲染全部
     const isPaginated = PAGINATED_CATS.includes(key);
@@ -2195,6 +2214,52 @@ function refilterFive() {
     if (el) el.textContent = `显示 ${count} 条`;
 }
 
+function formatHours(value) {
+    return Number(value).toFixed(2).replace(/[.]00$/, "").replace(/([.][0-9])0$/, "$1") + "h";
+}
+
+function renderHoursSummary6(items, indices) {
+    const rows = indices.map(index => items[index]).filter(Boolean);
+    const persons = [...new Set(rows.map(item => item.person))].sort();
+    const chips = [...new Set(rows.map(item => item.chip || "未识别"))].sort();
+    if (!rows.length) return '<div class="hours-summary"><h4>工时汇总</h4><div class="empty-state">当前筛选范围无数据</div></div>';
+    const matrix = {};
+    const personTotals = {};
+    const chipTotals = {};
+    for (const item of rows) {
+        const chip = item.chip || "未识别";
+        const hours = Number(item.hours) || 0;
+        matrix[item.person] ||= {};
+        matrix[item.person][chip] = (matrix[item.person][chip] || 0) + hours;
+        personTotals[item.person] = (personTotals[item.person] || 0) + hours;
+        chipTotals[chip] = (chipTotals[chip] || 0) + hours;
+    }
+    let html = '<div class="hours-summary"><h4>当前筛选范围工时汇总</h4><table><thead><tr><th>人员 / 机芯</th>';
+    html += chips.map(chip => `<th>${escapeHtml(chip)}</th>`).join('') + '<th>人员合计</th></tr></thead><tbody>';
+    for (const person of persons) {
+        html += `<tr><td>${escapeHtml(person)}</td>`;
+        html += chips.map(chip => `<td>${formatHours(matrix[person]?.[chip] || 0)}</td>`).join('');
+        html += `<td><strong>${formatHours(personTotals[person] || 0)}</strong></td></tr>`;
+    }
+    html += '<tr><td><strong>机芯合计</strong></td>';
+    html += chips.map(chip => `<td><strong>${formatHours(chipTotals[chip] || 0)}</strong></td>`).join('');
+    html += `<td><strong>${formatHours(rows.reduce((sum, item) => sum + (Number(item.hours) || 0), 0))}</strong></td></tr></tbody></table></div>`;
+    return html;
+}
+
+function toggleMultiFilter6(type, encodedValue, checked) {
+    const value = decodeURIComponent(encodedValue);
+    const selected = new Set(filterState6[type]);
+    if (checked) selected.add(value); else selected.delete(value);
+    filterState6[type] = [...selected];
+    refilterSix();
+}
+
+function updateSearch6(value) {
+    filterState6.search = value || "";
+    refilterSix();
+}
+
 function toggleSort(key, field) {
     const current = pageState[key]?.sort || "";
     const next = current === `${field}_asc` ? `${field}_desc` : `${field}_asc`;
@@ -2226,25 +2291,25 @@ function sortCategory(key, sortValue) {
 
 function refilterSix() {
     const cat = CAT_DATA["six"];
-    const person = document.getElementById("filter_person6")?.value || "all";
-    const chip = document.getElementById("filter_chip6")?.value || "all";
-    const search = (document.getElementById("search6")?.value || "").toLowerCase();
+    const persons = new Set(filterState6.persons);
+    const chips = new Set(filterState6.chips);
+    const search = filterState6.search.toLowerCase();
     // 数据过滤：计算匹配的索引列表
     const filtered = [];
     for (let i = 0; i < cat.items.length; i++) {
         const item = cat.items[i];
-        const match = (person === "all" || item.person.includes(person)) &&
-            (chip === "all" || item.chip === chip) &&
-            (!search || (item.title + item.content + item.project + item.chip + item.date + item.person).toLowerCase().includes(search));
+        const match = (persons.size === 0 || persons.has(item.person)) &&
+            (chips.size === 0 || chips.has(item.chip)) &&
+            (!search || (item.title + item.content + item.project + (item.chip || "") + item.date + item.person).toLowerCase().includes(search));
         if (match) filtered.push(i);
     }
     // 更新分页状态的过滤索引
     pageState["six"].filteredIndices = filtered;
-    if (pageState["six"].sort) sortCategory("six", pageState["six"].sort);
     pageState["six"].currentPage = 0;  // 过滤后回到第一页
-    // 更新计数显示
-    const el = document.getElementById("filterCount6");
-    if (el) el.textContent = `显示 ${filtered.length} 条`;
+    if (pageState["six"].sort) {
+        sortCategory("six", pageState["six"].sort);
+        return;
+    }
     // 重新渲染面板
     renderPanel("six");
 }
