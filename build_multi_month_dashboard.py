@@ -127,6 +127,24 @@ def build_category_data(data, md_text, raw_data=None):
 
         explicit = str(explicit_id or "").strip()
         candidates = []
+        for record in matching_raw_records(
+            date, person, items=items, title=title, content=content,
+            hours=hours, explicit_id=explicit,
+        ):
+            candidates.append(str(record.get("approve_id") or "").strip())
+        candidates = normalize_approve_ids(candidates)
+        if len(candidates) == 1:
+            return candidates, None
+        if not candidates:
+            return [], "未能在当前原始归档中定位此条 SRDPM 明细"
+        return [], "此条异常匹配到多条 SRDPM 明细，已停止选择以避免误批"
+
+    def matching_raw_records(
+        date, person, *, items=None, title=None, content=None, hours=None, explicit_id=None
+    ):
+        """按第四项可见业务字段找出全部原始记录，保留重复记录供状态核验。"""
+        explicit = str(explicit_id or "").strip()
+        matches = []
         for record in raw_children:
             if record["date"] != date or record["person"] != person:
                 continue
@@ -148,13 +166,19 @@ def build_category_data(data, md_text, raw_data=None):
                         continue
                 except (TypeError, ValueError):
                     continue
-            candidates.append(approve_id)
-        candidates = normalize_approve_ids(candidates)
-        if len(candidates) == 1:
-            return candidates, None
-        if not candidates:
-            return [], "未能在当前原始归档中定位此条 SRDPM 明细"
-        return [], "此条异常匹配到多条 SRDPM 明细，已停止选择以避免误批"
+            matches.append(record)
+        return matches
+
+    def status_for_matching_records(
+        date, person, *, items=None, title=None, content=None, hours=None
+    ):
+        """重复明细全部已通过时可确认状态，但仍不生成可审批 ID。"""
+        matches = matching_raw_records(
+            date, person, items=items, title=title, content=content, hours=hours
+        )
+        if matches and all(record["child"].get("status") == "通过" for record in matches):
+            return "approved"
+        return "pending"
 
     def status_for_ids(approve_ids):
         records = {
@@ -367,6 +391,13 @@ def build_category_data(data, md_text, raw_data=None):
             content=entry.get("content", "").strip(),
             hours=entry.get("work_hours", 0),
         )
+        item_status = status_for_ids(approve_ids)
+        if not approve_ids and unavailable_reason and "多条" in unavailable_reason:
+            item_status = status_for_matching_records(
+                entry["date"], entry["person"], items=entry.get("items", ""),
+                title=entry.get("title", ""), content=entry.get("content", "").strip(),
+                hours=entry.get("work_hours", 0),
+            )
         cats["four"]["items"].append({
             "date": entry["date"],
             "person": entry["person"],
@@ -379,7 +410,7 @@ def build_category_data(data, md_text, raw_data=None):
             "chip": ", ".join(entry.get("chip_candidates", [])),
             "allowed": ", ".join(entry.get("allowed_chips", [])),
             "reason": entry.get("reason", ""),
-            "status": status_for_ids(approve_ids),
+            "status": item_status,
             "approve_ids": ",".join(approve_ids),
             "approval_unavailable_reason": unavailable_reason,
         })

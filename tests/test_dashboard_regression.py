@@ -74,6 +74,51 @@ class CurrentArchiveRegressionTests(unittest.TestCase):
         self.assertEqual("pending", item["status"])
         self.assertNotIn("approve_ids", item)
 
+    def test_ambiguous_duplicate_details_all_approved_show_approved_without_ids(self):
+        audit = {
+            "platform_summary": {},
+            "missed": {},
+            "no_checkin_leave": [],
+            "hours_over": [],
+            "hours_low": [],
+            "project_mismatch": [{
+                "date": "2026-07-02",
+                "person": "离线测试人员",
+                "items": "P-01",
+                "title": "项目归属异常",
+                "content": "重复归档明细",
+                "work_hours": 1,
+                "chip_candidates": ["MT026D6S2AT"],
+                "allowed_chips": ["MT9026"],
+                "reason": "测试异常",
+            }],
+        }
+        duplicate = {
+            "items": "P-01",
+            "title": "项目归属异常",
+            "content": "重复归档明细",
+            "work_hours": 1,
+            "status": "通过",
+        }
+        raw = {
+            "daily_data": {
+                "2026-07-02": {
+                    "list": [{
+                        "cn_name": "离线测试人员",
+                        "children": [
+                            {"approve_id": "duplicate-approved-1", **duplicate},
+                            {"approve_id": "duplicate-approved-2", **duplicate},
+                        ],
+                    }]
+                }
+            }
+        }
+        cats = dashboard.build_category_data(audit, "", raw)
+        item = cats["four"]["items"][0]
+        self.assertEqual("approved", item["status"])
+        self.assertEqual("", item["approve_ids"])
+        self.assertIn("多条", item["approval_unavailable_reason"])
+
     def test_july_dedup_and_assignment_invariants(self):
         raw, cats, groups = self.load_month("2026-07")
         raw_rows = sum(
