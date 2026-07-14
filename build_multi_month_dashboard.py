@@ -375,6 +375,8 @@ def build_category_data(data, md_text, raw_data=None):
             "title": entry.get("title", ""),
             "content": entry.get("content", "").strip(),
             "hours": float(entry.get("work_hours", 0)),
+            # 实际申报项目中识别到的机芯；允许机芯仍是 Wiki 映射出的人员范围。
+            "chip": ", ".join(entry.get("chip_candidates", [])),
             "allowed": ", ".join(entry.get("allowed_chips", [])),
             "reason": entry.get("reason", ""),
             "status": status_for_ids(approve_ids),
@@ -1383,8 +1385,8 @@ function renderTable(key, cat) {
         cols = ["date", "person", "subtype", "reported", "checked", "leave", "effective", "ratio", "detail", "status", "action"];
         headers = ["日期", "人员", "类型", "申报(h)", "打卡(h)", "休假(h)", "有效申报(h)", "比例", "工作内容", "审核状态", "操作"];
     } else if (key === "four") {
-        cols = ["date", "person", "customer", "items", "title", "content", "hours", "allowed", "reason", "status", "action"];
-        headers = ["日期", "人员", "客户", "项目代码", "标题", "工作内容", "工时", "允许机芯", "问题", "审核状态", "操作"];
+        cols = ["date", "person", "customer", "items", "title", "content", "hours", "chip", "allowed", "reason", "status", "action"];
+        headers = ["日期", "人员", "客户", "项目代码", "标题", "工作内容", "工时", "机芯", "允许机芯", "问题", "审核状态", "操作"];
     } else if (key === "five") {
         cols = ["date", "person", "project", "title", "content", "hours", "status", "action"];
         headers = ["日期", "人员", "项目", "标题", "工作内容", "工时", "审批状态", "操作"];
