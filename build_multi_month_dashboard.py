@@ -832,6 +832,8 @@ body.approval-busy .btn-refresh-dashboard { pointer-events: none; opacity: .55; 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 thead { background: #fafafa; position: sticky; top: 0; z-index: 1; }
 th { padding: 10px 12px; text-align: left; font-weight: 600; color: #444; border-bottom: 2px solid #e0e0e0; white-space: nowrap; }
+.sortable-header { border: 0; padding: 0; background: transparent; color: inherit; font: inherit; font-weight: inherit; cursor: pointer; }
+.sortable-header:hover { color: #3949ab; text-decoration: underline; }
 td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
 tr:hover { background: #f8f9ff; }
 td.nowrap { white-space: nowrap; }
@@ -1455,33 +1457,6 @@ function renderTable(key, cat) {
             <span class="filter-count" id="filterCount6"></span>
         </div>`;
     }
-    if (key === "four") {
-        filterHtml = `<div class="filter-row">
-            <label>排序：</label>
-            <select id="sort_four" onchange="sortCategory('four', this.value)">
-                <option value="">默认顺序</option>
-                <option value="date_asc">按日期升序</option>
-                <option value="date_desc">按日期降序</option>
-                <option value="project_asc">按项目升序</option>
-                <option value="project_desc">按项目降序</option>
-                <option value="chip_asc">按机芯升序</option>
-                <option value="chip_desc">按机芯降序</option>
-            </select>
-        </div>`;
-    }
-    if (key === "six") {
-        filterHtml += `<label>排序：</label>
-            <select id="sort_six" onchange="sortCategory('six', this.value)">
-                <option value="">默认顺序</option>
-                <option value="date_asc">按日期升序</option>
-                <option value="date_desc">按日期降序</option>
-                <option value="project_asc">按项目升序</option>
-                <option value="project_desc">按项目降序</option>
-                <option value="chip_asc">按机芯升序</option>
-                <option value="chip_desc">按机芯降序</option>
-            </select>`;
-    }
-
     // 决定渲染哪些行：分页分类只渲染当前页，其他分类渲染全部
     const isPaginated = PAGINATED_CATS.includes(key);
     let indicesToRender;
@@ -1502,7 +1477,18 @@ function renderTable(key, cat) {
     }
 
     tableHtml += '<div class="table-wrap"><table><thead><tr>';
-    for (const h of headers) tableHtml += `<th>${h}</th>`;
+    for (let headerIndex = 0; headerIndex < headers.length; headerIndex++) {
+        const h = headers[headerIndex];
+        const field = cols[headerIndex];
+        const sortable = (key === "four" || key === "six") && ["date", "project", "chip"].includes(field);
+        if (sortable) {
+            const currentSort = pageState[key]?.sort || "";
+            const arrow = currentSort === `${field}_asc` ? " ▲" : (currentSort === `${field}_desc` ? " ▼" : " ⇅");
+            tableHtml += `<th><button class="sortable-header" type="button" onclick="toggleSort('${key}', '${field}')">${h}${arrow}</button></th>`;
+        } else {
+            tableHtml += `<th>${h}</th>`;
+        }
+    }
     tableHtml += "</tr></thead><tbody>";
 
     for (const i of indicesToRender) {
@@ -2207,6 +2193,12 @@ function refilterFive() {
     });
     const el = document.getElementById("filterCount5");
     if (el) el.textContent = `显示 ${count} 条`;
+}
+
+function toggleSort(key, field) {
+    const current = pageState[key]?.sort || "";
+    const next = current === `${field}_asc` ? `${field}_desc` : `${field}_asc`;
+    sortCategory(key, next);
 }
 
 function sortCategory(key, sortValue) {
