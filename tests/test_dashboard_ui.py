@@ -739,6 +739,18 @@ class DashboardUiTests(unittest.TestCase):
             self.assertIn(chip, summary_text)
         self.assert_no_page_errors()
 
+    def test_all_months_selector_opens_read_only_aggregate_summary(self):
+        month_keys = self.page.locator("#monthSelector .month-btn").evaluate_all(
+            "buttons => buttons.map(button => button.dataset.month)"
+        )
+        self.assertEqual(month_keys[0], "__all__")
+        self.assertEqual(month_keys[1:], sorted(month_keys[1:]))
+        self.page.locator('.month-btn[data-month="__all__"]').click()
+        self.assertEqual(self.page.evaluate("currentMonth"), "__all__")
+        self.assertTrue(self.page.evaluate("IS_AGGREGATE_VIEW"))
+        self.assertIn("当前筛选范围工时汇总", self.page.locator("#panel_zero .hours-summary").inner_text())
+        self.assert_no_page_errors()
+
     def test_untrusted_archive_values_are_rendered_as_text(self):
         attack = '</script><img data-xss="1" src=x onerror="window.__xss=1">&"'
         self.page.evaluate(

@@ -8,7 +8,7 @@
 用法：
   python build_multi_month_dashboard.py
 """
-import json, os, re, glob, sys, io, tempfile
+import copy, json, os, re, glob, sys, io, tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -511,6 +511,7 @@ def build_category_data(data, md_text, raw_data=None):
         summary_items.append({
             "date": record["date"],
             "person": record["person"],
+            "approve_id": approve_id,
             "chip": bucket,
             "project": items_code,
             "title": child.get("title", "") or "",
@@ -749,6 +750,9 @@ def main():
 
     # Load all months
     all_month_data = {}
+    loaded_raw_data = []
+    loaded_categories = []
+    loaded_approval_groups = []
     for ml in months:
         audit_data, raw_data, md_text = load_month_audit(ml)
         cats = build_category_data(audit_data, md_text, raw_data)
@@ -776,6 +780,46 @@ def main():
             "team_members": audit_data.get("team_members", []),
             "fetch_time": audit_data.get("fetch_time", ""),
             "daily_summary": audit_data.get("daily_summary", []),
+        }
+        if raw_data:
+            loaded_raw_data.append(raw_data)
+        loaded_categories.append(cats)
+        loaded_approval_groups.append(approval_groups)
+
+    # Add a read-only aggregate view for all loaded archive months.
+    if len(months) > 1:
+        aggregate_cats = copy.deepcopy(loaded_categories[0])
+        for category in aggregate_cats.values():
+            category["items"] = []
+        for month_cats in loaded_categories:
+            for key, category in month_cats.items():
+                aggregate_cats.setdefault(key, {"title": key, "items": [], "no_approval": True})
+                aggregate_cats[key]["items"].extend(copy.deepcopy(category.get("items", [])))
+        unique_summary = {}
+        for item in aggregate_cats.get("zero", {}).get("items", []):
+            key = item.get("approve_id") or (
+                item.get("date"), item.get("person"), item.get("chip"),
+                item.get("project"), item.get("title"), item.get("content"), item.get("hours")
+            )
+            unique_summary[key] = item
+        aggregate_cats.get("zero", {})["items"] = list(unique_summary.values())
+        aggregate_groups = {}
+        for month_groups in loaded_approval_groups:
+            aggregate_groups.update(copy.deepcopy(month_groups))
+        merged_raw = {"daily_data": {}}
+        for raw_data in loaded_raw_data:
+            merged_raw["daily_data"].update(raw_data.get("daily_data", {}))
+        aggregate_cats["zero"]["desc"] = "覆盖所有已加载月份；按原始明细唯一 ID 去重汇总"
+        all_month_data["__all__"] = {
+            "display": "全部月份",
+            "cats": aggregate_cats,
+            "approval_groups": aggregate_groups,
+            "approval_summary": summarize_groups(aggregate_groups),
+            "enhanced": build_enhanced_stats(merged_raw),
+            "team_members": sorted({person for data in all_month_data.values() for person in data.get("team_members", [])}),
+            "fetch_time": "各月归档汇总",
+            "daily_summary": [summary for data in all_month_data.values() for summary in data.get("daily_summary", [])],
+            "aggregate": True,
         }
 
     # Build HTML
@@ -1066,7 +1110,9 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 <script>
 // ===== 数据 =====
 const ALL_DATA = __ALL_DATA_PLACEHOLDER__;
-const MONTHS = Object.keys(ALL_DATA).sort().reverse(); // 最新的月在前
+const ALL_MONTHS_KEY = "__all__";
+const MONTHS = Object.keys(ALL_DATA).filter(month => month !== ALL_MONTHS_KEY).sort(); // 按时间从早到晚
+const MONTH_SELECTOR_MONTHS = ALL_DATA[ALL_MONTHS_KEY] ? [ALL_MONTHS_KEY, ...MONTHS] : MONTHS;
 
 function readLocalServiceConfig() {
     const element = document.getElementById("srdpm-local-service-config");
@@ -1090,10 +1136,11 @@ function escapeHtml(value) {
     })[ch]);
 }
 
-let currentMonth = MONTHS[0]; // 默认选最新月
+let currentMonth = MONTHS[MONTHS.length - 1]; // 默认选最新月
 let CAT_DATA = {};
 let APPROVAL_GROUPS = {};
 let currentCatKey = "zero";
+let IS_AGGREGATE_VIEW = false;
 
 // localStorage 只保存“已选择”；已审批只来自归档或本次服务端回读结果。
 // 服务端每次仍从归档重建白名单并实时复检，不信任浏览器状态。
@@ -1244,14 +1291,15 @@ function importTransferredApprovalSelection() {
 function renderMonthSelector() {
     const sel = document.getElementById("monthSelector");
     let html = '<span class="label">📅 选择月份：</span>';
-    for (const ml of MONTHS) {
+    for (const ml of MONTH_SELECTOR_MONTHS) {
         const md = ALL_DATA[ml].display;
         const summary = ALL_DATA[ml].approval_summary || {};
         const manualGroups = summary.manual_pending_groups || 0;
         const autoGroups = summary.auto_pending_groups || 0;
         const isActive = ml === currentMonth;
-        html += `<button class="month-btn ${isActive ? 'active' : ''}" data-month="${ml}" onclick="switchMonth('${ml}')">
-            ${escapeHtml(md)}<span class="badge">${manualGroups}人工</span>${autoGroups > 0 ? `<span class="badge" style="background:#1a7a1a;color:#fff;">${autoGroups}候选</span>` : ''}
+        const isAggregate = ml === ALL_MONTHS_KEY;
+        html += `<button class="month-btn ${isAggregate ? 'aggregate' : ''} ${isActive ? 'active' : ''}" data-month="${ml}" onclick="switchMonth('${ml}')">
+            ${escapeHtml(md)}${isAggregate ? '' : `<span class="badge">${manualGroups}人工</span>${autoGroups > 0 ? `<span class="badge" style="background:#1a7a1a;color:#fff;">${autoGroups}候选</span>` : ''}`}
         </button>`;
     }
     sel.innerHTML = html;
@@ -1262,6 +1310,7 @@ function switchMonth(ml) {
     currentMonth = ml;
     CAT_DATA = ALL_DATA[ml].cats;
     APPROVAL_GROUPS = ALL_DATA[ml].approval_groups || {};
+    IS_AGGREGATE_VIEW = ml === ALL_MONTHS_KEY;
     loadState(ml);
     sanitizeState();
     resetAllPageState();
@@ -1371,6 +1420,7 @@ function getFilteredIndices(key) {
 }
 
 function renderBulkActions(key) {
+    if (IS_AGGREGATE_VIEW) return "";
     if (!APPROVE_CATS.includes(key)) return "";
     const allViewGroupKeys = groupKeysForCategory(key, false);
     const viewCounts = deriveCounts(allViewGroupKeys);
@@ -1622,6 +1672,10 @@ function renderTable(key, cat) {
                 }
                 tableHtml += `<td class="nowrap"><span class="status-badge ${cls}">${escapeHtml(text)}</span></td>`;
             } else if (col === "action") {
+                if (IS_AGGREGATE_VIEW) {
+                    tableHtml += '<td class="nowrap">汇总视图</td>';
+                    continue;
+                }
                 const group = APPROVAL_GROUPS[item.approval_group_key] || {};
                 const isManualGroup = group.review_mode === "manual";
                 const primaryCategory = group.primary_category || key;
@@ -1738,7 +1792,7 @@ function changePageSize(key, size) {
 
 // ===== 审批交互 =====
 function toggleApproval(catKey, idx) {
-    if (approvalExecutionActive) return;
+    if (approvalExecutionActive || IS_AGGREGATE_VIEW) return;
     const item = CAT_DATA[catKey]?.items[idx];
     const groupKey = item?.approval_group_key;
     if (!groupKey) return;
@@ -2083,6 +2137,10 @@ async function pollDashboardRefreshJob(jobId) {
 
 async function refreshDashboardData() {
     if (approvalExecutionActive) return;
+    if (IS_AGGREGATE_VIEW) {
+        setApprovalFeedback("info", "全部月份是只读汇总视图，请先选择具体月份再重新读取数据。");
+        return;
+    }
     if (!LOCAL_SERVICE) {
         // A file:// page cannot safely turn a top-level navigation into a
         // credential-backed refresh.  Open the protected same-origin page first.
@@ -2173,7 +2231,7 @@ async function applyApprovalJobResult(job, executionMonth) {
 }
 
 async function executeSelectedApprovals() {
-    if (approvalExecutionActive) return;
+    if (approvalExecutionActive || IS_AGGREGATE_VIEW) return;
     const plan = buildSelectedApprovalPlan();
     if (!plan) return;
     if (!LOCAL_SERVICE) {
