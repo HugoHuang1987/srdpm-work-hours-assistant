@@ -763,6 +763,18 @@ class DashboardUiTests(unittest.TestCase):
         self.assertTrue(self.page.evaluate("IS_AGGREGATE_VIEW"))
         self.assert_no_page_errors()
 
+    def test_project_mismatch_table_is_paginated(self):
+        self.page.evaluate("switchMonth('2026-01')")
+        self.page.locator('.cat-nav-item[data-cat="four"]').click()
+        total = self.page.evaluate("CAT_DATA.four.items.length")
+        self.assertGreater(total, 20)
+        self.assertTrue(self.page.evaluate("PAGINATED_CATS.includes('four')"))
+        self.assertEqual(20, self.page.locator("#panel_four tbody tr").count())
+        self.assertIn("页", self.page.locator("#panel_four .pagination-bar").first.inner_text())
+        self.page.evaluate("gotoPage('four', 1)")
+        self.assertEqual(20, self.page.locator("#panel_four tbody tr").count())
+        self.assert_no_page_errors()
+
     def test_untrusted_archive_values_are_rendered_as_text(self):
         attack = '</script><img data-xss="1" src=x onerror="window.__xss=1">&"'
         self.page.evaluate(

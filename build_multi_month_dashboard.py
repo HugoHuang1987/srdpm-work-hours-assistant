@@ -1393,8 +1393,8 @@ function switchTab(key) {
 
 // ===== 分页状态 =====
 const PAGE_SIZES = [10, 20, 50, 100];
-// 只对大数据量分类（six=正常申报）启用分页，其他分类数据量小无需分页
-const PAGINATED_CATS = ["six"];
+// 对大数据量分类（four=项目归属异常、six=正常申报）启用分页
+const PAGINATED_CATS = ["four", "six"];
 let pageState = {};  // { catKey: { pageSize: 20, currentPage: 0, filteredIndices: [0,1,2,...] } }
 let filterState0 = {persons: [], chips: []};
 let filterState6 = {persons: [], chips: [], search: ""};
