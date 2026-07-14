@@ -441,6 +441,13 @@ def build_category_data(data, md_text, raw_data=None):
             # 排除：出差/请假标题
             title = child.get("title", "")
             content = child.get("content", "")
+            project_name = child.get("project_name", "") or ""
+            chip = ""
+            chip_match = re.search(r'\d((?:MT|AM)\d{3,4}[A-Z0-9]*)', str(project_name))
+            if chip_match:
+                chip_code = chip_match.group(1)
+                chip_prefix = re.match(r'(?:MT|AM)\d{3,4}', chip_code)
+                chip = chip_prefix.group(0) if chip_prefix else chip_code
             if any(kw in (title + content) for kw in ["出差", "休假", "请假", "leave", "Leave"]):
                 continue
             # 正常条目按这一条 SRDPM 明细选择，避免扩大为人员日期整单。
@@ -448,6 +455,7 @@ def build_category_data(data, md_text, raw_data=None):
                 "date": day_date,
                 "person": person,
                 "project": items_code,
+                "chip": chip,
                 "title": title,
                 "content": content.strip(),
                 "hours": float(child.get("work_hours", 0)),
@@ -1391,8 +1399,8 @@ function renderTable(key, cat) {
         cols = ["date", "person", "project", "title", "content", "hours", "status", "action"];
         headers = ["日期", "人员", "项目", "标题", "工作内容", "工时", "审批状态", "操作"];
     } else if (key === "six") {
-        cols = ["date", "person", "project", "title", "content", "hours", "status", "action"];
-        headers = ["日期", "人员", "项目", "标题", "工作内容", "工时", "审核状态", "操作"];
+        cols = ["date", "person", "project", "chip", "title", "content", "hours", "status", "action"];
+        headers = ["日期", "人员", "项目", "机芯", "标题", "工作内容", "工时", "审核状态", "操作"];
     } else {
         cols = ["date", "person", "detail", "status"];
         headers = ["日期", "人员", "详情", "审批状态"];
@@ -1431,11 +1439,17 @@ function renderTable(key, cat) {
     }
     if (key === "six") {
         const persons6 = [...new Set(items.map(i => i.person))].sort();
+        const chips6 = [...new Set(items.map(i => i.chip).filter(Boolean))].sort();
         filterHtml = `<div class="filter-row">
             <label>人员：</label>
             <select id="filter_person6" onchange="refilterSix()">
                 <option value="all">全部</option>
                 ${persons6.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('')}
+            </select>
+            <label>机芯：</label>
+            <select id="filter_chip6" onchange="refilterSix()">
+                <option value="all">全部</option>
+                ${chips6.map(chip => `<option value="${escapeHtml(chip)}">${escapeHtml(chip)}</option>`).join('')}
             </select>
             <input type="text" id="search6" placeholder="搜索内容..." oninput="refilterSix()" style="width:200px;">
             <span class="filter-count" id="filterCount6"></span>
@@ -2172,12 +2186,15 @@ function refilterFive() {
 function refilterSix() {
     const cat = CAT_DATA["six"];
     const person = document.getElementById("filter_person6")?.value || "all";
+    const chip = document.getElementById("filter_chip6")?.value || "all";
     const search = (document.getElementById("search6")?.value || "").toLowerCase();
     // 数据过滤：计算匹配的索引列表
     const filtered = [];
     for (let i = 0; i < cat.items.length; i++) {
         const item = cat.items[i];
-        const match = (person === "all" || item.person.includes(person)) && (!search || (item.title + item.content + item.project + item.date + item.person).toLowerCase().includes(search));
+        const match = (person === "all" || item.person.includes(person)) &&
+            (chip === "all" || item.chip === chip) &&
+            (!search || (item.title + item.content + item.project + item.chip + item.date + item.person).toLowerCase().includes(search));
         if (match) filtered.push(i);
     }
     // 更新分页状态的过滤索引
