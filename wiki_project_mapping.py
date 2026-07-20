@@ -8,6 +8,7 @@ used by the SRDPM audit.  Nothing from the attachment is extracted to disk.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -44,6 +45,9 @@ MAX_XML_BYTES = 20 * 1024 * 1024
 MAX_SHEET_ROWS = 2000
 MAX_SHEET_COLUMNS = 500
 REQUEST_TIMEOUT = (10, 60)
+MAPPING_SCHEMA_VERSION = 3
+AUTHORIZATION_RETENTION_POLICY_VERSION = 1
+AUTHORIZATION_GRACE_MONTHS = 2
 RELEVANT_COLUMNS = {
     "customer": 1,
     "project": 2,
@@ -405,6 +409,293 @@ def _is_recognizable_chip(chip: str) -> bool:
     return CHIP_PATTERN.fullmatch(chip) is not None
 
 
+def mapping_entry_chip(value: Any) -> str:
+    """Extract one chip without confusing aliases such as ``MT9603/L``."""
+
+    text = re.sub(r"\s+", "", _clean_text(value)).upper()
+    if not text:
+        raise WikiMappingValidationError("人员允许机芯为空")
+    if _is_recognizable_chip(text):
+        return text
+    if "/" in text:
+        _customer, chip = text.split("/", 1)
+        if _is_recognizable_chip(chip):
+            return chip
+    raise WikiMappingValidationError("人员允许机芯格式无法安全识别")
+
+
+def canonical_chip_key(chip: Any) -> str:
+    """Return an exact permission key while treating T and AM as one family."""
+
+    pure = mapping_entry_chip(chip)
+    match = re.fullmatch(r"(AM|MT|T)(\d{2,4})([A-Z0-9]*(?:/[A-Z0-9]+)?)", pure)
+    if match is None:
+        raise WikiMappingValidationError("人员允许机芯格式无法安全识别")
+    prefix, number, suffix = match.groups()
+    if prefix == "T":
+        prefix = "AM"
+    return f"{prefix}{number}{suffix}"
+
+
+def _month_label(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def _parse_month_label(value: Any) -> tuple[int, int]:
+    if not isinstance(value, str) or re.fullmatch(r"\d{4}-\d{2}", value) is None:
+        raise WikiMappingValidationError("授权宽限月份格式异常")
+    year, month = (int(part) for part in value.split("-"))
+    if year < 2000 or year > 2200 or month < 1 or month > 12:
+        raise WikiMappingValidationError("授权宽限月份无效")
+    return year, month
+
+
+def _add_months(month_label: str, months: int) -> str:
+    year, month = _parse_month_label(month_label)
+    index = year * 12 + month - 1 + months
+    return _month_label(index // 12, index % 12 + 1)
+
+
+def _mapping_source_attachment_date(mapping: dict[str, Any]) -> datetime:
+    source = mapping.get("source")
+    filename = source.get("filename") if isinstance(source, dict) else None
+    match = ATTACHMENT_NAME_PATTERN.fullmatch(filename or "")
+    if match is None:
+        raise WikiMappingValidationError("项目映射来源月份异常")
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d")
+    except ValueError as exc:
+        raise WikiMappingValidationError("项目映射来源月份异常") from exc
+
+
+def _mapping_source_month(mapping: dict[str, Any]) -> str:
+    parsed = _mapping_source_attachment_date(mapping)
+    return _month_label(parsed.year, parsed.month)
+
+
+def _mapping_source_order(mapping: dict[str, Any]) -> tuple[datetime, float, int]:
+    source = mapping.get("source")
+    if not isinstance(source, dict):
+        raise WikiMappingValidationError("项目映射来源格式异常")
+    attachment_id = str(source.get("attachment_id", "")).strip()
+    updated_at = source.get("updated_at")
+    if not attachment_id.isdigit() or not isinstance(updated_at, str):
+        raise WikiMappingValidationError("项目映射来源格式异常")
+    try:
+        updated = datetime.fromisoformat(updated_at.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise WikiMappingValidationError("项目映射更新时间异常") from exc
+    if updated.tzinfo is None:
+        raise WikiMappingValidationError("项目映射更新时间缺少时区")
+    return (
+        _mapping_source_attachment_date(mapping),
+        updated.timestamp(),
+        int(attachment_id),
+    )
+
+
+def _source_reference(mapping: dict[str, Any]) -> dict[str, str]:
+    source = mapping.get("source")
+    if not isinstance(source, dict):
+        return {"kind": "legacy_mapping"}
+    result = {
+        key: str(source.get(key, "")).strip()
+        for key in ("kind", "attachment_id", "filename", "updated_at", "sha256")
+        if str(source.get(key, "")).strip()
+    }
+    return result or {"kind": "legacy_mapping"}
+
+
+def _permission_map(person_projects: Any) -> dict[tuple[str, str], str]:
+    if not isinstance(person_projects, dict):
+        raise WikiMappingValidationError("人员允许机芯范围格式异常")
+    result: dict[tuple[str, str], str] = {}
+    for person, entries in person_projects.items():
+        if (
+            not isinstance(person, str)
+            or not person.strip()
+            or not isinstance(entries, list)
+            or not entries
+        ):
+            raise WikiMappingValidationError("人员允许机芯范围格式异常")
+        for entry in entries:
+            if not isinstance(entry, str) or not entry.strip():
+                raise WikiMappingValidationError("人员允许机芯范围格式异常")
+            chip = mapping_entry_chip(entry)
+            result.setdefault((person.strip(), canonical_chip_key(chip)), chip)
+    return result
+
+
+def _validated_retention_records(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    schema_version = mapping.get("schema_version")
+    if schema_version in (None, 2):
+        # Pre-retention mappings are accepted only as the current-permission
+        # baseline.  A malformed schema-3 history must never be silently reset.
+        _permission_map(mapping.get("person_projects"))
+        return []
+    if schema_version != MAPPING_SCHEMA_VERSION:
+        raise WikiMappingValidationError("项目映射版本不受支持")
+    retention = mapping.get("authorization_retention")
+    if not isinstance(retention, dict):
+        raise WikiMappingValidationError("授权宽限历史缺失")
+    if (
+        retention.get("policy_version") != AUTHORIZATION_RETENTION_POLICY_VERSION
+        or retention.get("grace_months") != AUTHORIZATION_GRACE_MONTHS
+        or retention.get("month_semantics") != "removal_month_plus_two_full_calendar_months"
+        or not isinstance(retention.get("records"), list)
+    ):
+        raise WikiMappingValidationError("授权宽限策略格式异常")
+
+    validated = []
+    seen = set()
+    for raw in retention["records"]:
+        if not isinstance(raw, dict):
+            raise WikiMappingValidationError("授权宽限记录格式异常")
+        person = raw.get("person")
+        chip = raw.get("chip")
+        canonical = raw.get("canonical_chip")
+        removed_month = raw.get("removed_month")
+        valid_through = raw.get("valid_through_month")
+        valid_from = raw.get("valid_from_month")
+        readded_month = raw.get("readded_month")
+        if (
+            not isinstance(person, str)
+            or not person.strip()
+            or not isinstance(chip, str)
+            or not chip.strip()
+            or canonical != canonical_chip_key(chip)
+            or valid_through != _add_months(removed_month, AUTHORIZATION_GRACE_MONTHS)
+            or not isinstance(raw.get("last_present_source"), dict)
+            or not isinstance(raw.get("removed_by_source"), dict)
+        ):
+            raise WikiMappingValidationError("授权宽限记录内容异常")
+        if valid_from is not None:
+            _parse_month_label(valid_from)
+            if valid_from > removed_month:
+                raise WikiMappingValidationError("授权宽限生效月份晚于撤出月份")
+        if readded_month is not None:
+            _parse_month_label(readded_month)
+            if readded_month < removed_month:
+                raise WikiMappingValidationError("授权重新加入月份早于撤出月份")
+        key = (person.strip(), canonical, removed_month)
+        if key in seen:
+            raise WikiMappingValidationError("授权宽限记录重复")
+        seen.add(key)
+        validated.append(copy.deepcopy(raw))
+    return validated
+
+
+def validate_authorization_retention(mapping: dict[str, Any]) -> None:
+    """Validate the strict-current plus durable-retention mapping contract."""
+
+    if not isinstance(mapping, dict) or mapping.get("schema_version") != MAPPING_SCHEMA_VERSION:
+        raise WikiMappingValidationError("项目映射未启用授权宽限历史")
+    _permission_map(mapping.get("person_projects"))
+    _validated_retention_records(mapping)
+
+
+def reconcile_authorization_retention(
+    previous_mapping: dict[str, Any] | None,
+    current_mapping: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach durable two-month removal episodes to a strict current snapshot."""
+
+    current_permissions = _permission_map(current_mapping.get("person_projects"))
+    current_month = _mapping_source_month(current_mapping)
+    previous_permissions: dict[tuple[str, str], str] = {}
+    records: list[dict[str, Any]] = []
+    if previous_mapping is not None:
+        if not isinstance(previous_mapping, dict):
+            raise WikiMappingValidationError("现有项目映射格式异常")
+        previous_permissions = _permission_map(previous_mapping.get("person_projects"))
+        records = _validated_retention_records(previous_mapping)
+        previous_source = previous_mapping.get("source")
+        if isinstance(previous_source, dict) and previous_source.get("filename"):
+            if _mapping_source_order(previous_mapping) > _mapping_source_order(current_mapping):
+                raise WikiMappingValidationError("Wiki 最新附件早于现有项目映射")
+
+    # A reappearance closes the absence behind the latest episode.  If the same
+    # permission is removed again later, this month becomes the new episode's
+    # lower bound, preventing it from authorizing an earlier gap month.
+    for person, canonical in sorted(current_permissions):
+        if (person, canonical) in previous_permissions:
+            continue
+        prior_records = [
+            record
+            for record in records
+            if record["person"] == person and record["canonical_chip"] == canonical
+        ]
+        if prior_records:
+            latest = max(
+                prior_records,
+                key=lambda item: (item["removed_month"], item["valid_through_month"]),
+            )
+            latest.setdefault("readded_month", current_month)
+
+    existing = {
+        (record["person"], record["canonical_chip"], record["removed_month"])
+        for record in records
+    }
+    for (person, canonical), chip in sorted(previous_permissions.items()):
+        if (person, canonical) in current_permissions:
+            continue
+        key = (person, canonical, current_month)
+        if key in existing:
+            # A permission can be removed, re-added, and removed again inside
+            # one source month.  Month-level policy still has one episode, but
+            # its final absent state must not retain a stale re-add marker.
+            for prior in records:
+                if (
+                    prior["person"] == person
+                    and prior["canonical_chip"] == canonical
+                    and prior["removed_month"] == current_month
+                ):
+                    prior.pop("readded_month", None)
+            continue
+        record = {
+            "person": person,
+            "chip": chip,
+            "canonical_chip": canonical,
+            "removed_month": current_month,
+            "valid_through_month": _add_months(
+                current_month, AUTHORIZATION_GRACE_MONTHS
+            ),
+            "last_present_source": _source_reference(previous_mapping or {}),
+            "removed_by_source": _source_reference(current_mapping),
+        }
+        prior_records = [
+            prior
+            for prior in records
+            if prior["person"] == person and prior["canonical_chip"] == canonical
+        ]
+        if prior_records:
+            latest = max(
+                prior_records,
+                key=lambda item: (item["removed_month"], item["valid_through_month"]),
+            )
+            valid_from = latest.get("readded_month")
+            if valid_from:
+                record["valid_from_month"] = valid_from
+        records.append(record)
+
+    records.sort(
+        key=lambda item: (
+            item["person"],
+            item["canonical_chip"],
+            item["removed_month"],
+        )
+    )
+    reconciled = copy.deepcopy(current_mapping)
+    reconciled["schema_version"] = MAPPING_SCHEMA_VERSION
+    reconciled["authorization_retention"] = {
+        "policy_version": AUTHORIZATION_RETENTION_POLICY_VERSION,
+        "grace_months": AUTHORIZATION_GRACE_MONTHS,
+        "month_semantics": "removal_month_plus_two_full_calendar_months",
+        "records": records,
+    }
+    return reconciled
+
+
 def _validate_archive(content: bytes, expected_size: int) -> zipfile.ZipFile:
     if len(content) != expected_size:
         raise WikiMappingValidationError("Wiki 附件大小与清单不一致")
@@ -602,6 +893,24 @@ def _write_mapping_if_changed(target_path: Path, mapping: dict[str, Any]) -> boo
     return True
 
 
+def _load_existing_mapping(target_path: Path) -> dict[str, Any] | None:
+    if not target_path.exists():
+        return None
+    if not target_path.is_file():
+        raise WikiMappingValidationError("现有项目映射路径异常")
+    try:
+        payload = json.loads(target_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WikiMappingValidationError("现有项目映射无法读取") from exc
+    if not isinstance(payload, dict):
+        raise WikiMappingValidationError("现有项目映射格式异常")
+    # Validate before any network request so damaged retention history cannot be
+    # overwritten by an apparently successful Wiki refresh.
+    _permission_map(payload.get("person_projects"))
+    _validated_retention_records(payload)
+    return payload
+
+
 def refresh_project_mapping(
     target_path: Path | str,
     *,
@@ -610,6 +919,8 @@ def refresh_project_mapping(
 ) -> MappingRefreshResult:
     """Check the trusted page and refresh ``target_path`` from its newest XLSX."""
 
+    resolved_target = Path(target_path).resolve()
+    previous_mapping = _load_existing_mapping(resolved_target)
     selected_token = token if token is not None else os.environ.get(WIKI_PAT_ENV, "")
     if not isinstance(selected_token, str) or not selected_token.strip():
         raise WikiMappingCredentialError("未配置 Wiki 访问凭据")
@@ -632,8 +943,9 @@ def refresh_project_mapping(
             token=selected_token,
             maximum=MAX_DOWNLOAD_BYTES,
         )
-        mapping = parse_project_mapping_xlsx(workbook_content, attachment)
-        updated = _write_mapping_if_changed(Path(target_path).resolve(), mapping)
+        current_mapping = parse_project_mapping_xlsx(workbook_content, attachment)
+        mapping = reconcile_authorization_retention(previous_mapping, current_mapping)
+        updated = _write_mapping_if_changed(resolved_target, mapping)
         return MappingRefreshResult(
             updated=updated,
             attachment_id=attachment.id,
@@ -655,6 +967,10 @@ __all__ = [
     "WikiMappingDownloadError",
     "WikiMappingError",
     "WikiMappingValidationError",
+    "canonical_chip_key",
+    "mapping_entry_chip",
     "parse_project_mapping_xlsx",
+    "reconcile_authorization_retention",
     "refresh_project_mapping",
+    "validate_authorization_retention",
 ]

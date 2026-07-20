@@ -381,7 +381,6 @@ class RefreshProjectMappingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             target = Path(temporary_dir) / "project_mapping.json"
-            target.write_text('{"old":true}', encoding="utf-8")
 
             result = wiki_mapping.refresh_project_mapping(
                 target, session=session, token="offline-test-token"
@@ -397,6 +396,113 @@ class RefreshProjectMappingTests(unittest.TestCase):
         self.assertEqual(
             "https://idisplayvision.com/wiki" + download_path,
             download_urls[0],
+        )
+
+    def test_removed_legacy_assignment_is_retained_and_refresh_is_idempotent(self):
+        content = _valid_xlsx()
+        download_path = "/download/attachments/22824730/project-load.xlsx?version=1"
+        attachment = _attachment_api_item(
+            attachment_id="132360786",
+            filename=ATTACHMENT_FILENAME,
+            updated_at="2026-07-20T17:06:07.730+08:00",
+            size=len(content),
+            download_path=download_path,
+        )
+        session = FakeWikiSession(
+            [attachment], {download_path: FakeResponse(content=content)}
+        )
+        legacy = wiki_mapping.parse_project_mapping_xlsx(
+            content, _attachment(content)
+        )
+        legacy["person_projects"]["陈泽钦"].append("MT9603L")
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            target = Path(temporary_dir) / "project_mapping.json"
+            target.write_text(
+                json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            first = wiki_mapping.refresh_project_mapping(
+                target, session=session, token="offline-test-token"
+            )
+            first_bytes = target.read_bytes()
+            saved = json.loads(first_bytes.decode("utf-8"))
+            records = saved["authorization_retention"]["records"]
+            retained = [
+                record
+                for record in records
+                if record["person"] == "陈泽钦"
+                and record["chip"] == "MT9603L"
+            ]
+            self.assertTrue(first.updated)
+            self.assertEqual(1, len(retained))
+            self.assertEqual("2026-07", retained[0]["removed_month"])
+            self.assertEqual("2026-09", retained[0]["valid_through_month"])
+            self.assertNotIn(
+                "MT9603L", saved["person_projects"]["陈泽钦"]
+            )
+
+            second = wiki_mapping.refresh_project_mapping(
+                target, session=session, token="offline-test-token"
+            )
+            self.assertFalse(second.updated)
+            self.assertEqual(first_bytes, target.read_bytes())
+
+    def test_malformed_retention_fails_closed_before_network(self):
+        content = _valid_xlsx()
+        current = wiki_mapping.reconcile_authorization_retention(
+            None,
+            wiki_mapping.parse_project_mapping_xlsx(content, _attachment(content)),
+        )
+        current["authorization_retention"]["records"] = [{"person": "陈泽钦"}]
+        original = json.dumps(current, ensure_ascii=False, indent=2) + "\n"
+        session = FakeWikiSession([], {})
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            target = Path(temporary_dir) / "project_mapping.json"
+            target.write_text(original, encoding="utf-8")
+
+            with self.assertRaises(wiki_mapping.WikiMappingValidationError):
+                wiki_mapping.refresh_project_mapping(
+                    target, session=session, token="offline-test-token"
+                )
+
+            self.assertEqual(original, target.read_text(encoding="utf-8"))
+            self.assertEqual([], session.urls)
+
+    def test_same_month_older_attachment_cannot_roll_back_existing_mapping(self):
+        content = _valid_xlsx()
+        previous = wiki_mapping.reconcile_authorization_retention(
+            None,
+            wiki_mapping.parse_project_mapping_xlsx(content, _attachment(content)),
+        )
+        original = json.dumps(previous, ensure_ascii=False, indent=2) + "\n"
+        older_path = "/download/attachments/22824730/older.xlsx?version=1"
+        older = _attachment_api_item(
+            attachment_id="120000001",
+            filename=OLDER_ATTACHMENT_FILENAME,
+            updated_at="2026-07-14T10:00:00+08:00",
+            size=len(content),
+            download_path=older_path,
+        )
+        session = FakeWikiSession(
+            [older], {older_path: FakeResponse(content=content)}
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            target = Path(temporary_dir) / "project_mapping.json"
+            target.write_text(original, encoding="utf-8")
+
+            with self.assertRaises(wiki_mapping.WikiMappingValidationError):
+                wiki_mapping.refresh_project_mapping(
+                    target, session=session, token="offline-test-token"
+                )
+
+            self.assertEqual(original, target.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["https://idisplayvision.com/wiki" + older_path],
+            [url for url in session.urls if "/attachments/" in url],
         )
 
     def test_corrupt_newest_attachment_fails_without_falling_back(self):
@@ -442,7 +548,20 @@ class RefreshProjectMappingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             target = Path(temporary_dir) / "project_mapping.json"
-            original = '{"sentinel":"keep-current-mapping"}'
+            previous_current = wiki_mapping.parse_project_mapping_xlsx(
+                old_content,
+                _attachment(
+                    old_content,
+                    attachment_id="120000001",
+                    filename=OLDER_ATTACHMENT_FILENAME,
+                    updated_at="2026-07-14T10:00:00+08:00",
+                    download_path=old_path,
+                ),
+            )
+            previous = wiki_mapping.reconcile_authorization_retention(
+                None, previous_current
+            )
+            original = json.dumps(previous, ensure_ascii=False, indent=2) + "\n"
             target.write_text(original, encoding="utf-8")
 
             with self.assertRaises(Exception):

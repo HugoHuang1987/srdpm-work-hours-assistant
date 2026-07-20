@@ -39,6 +39,16 @@ class FakeMappingRefresher:
         self.fail = False
         self.attachment_filename = "团队成员项目负荷_新拆分-20260720.xlsx"
         self.payload = {
+            "schema_version": 3,
+            "source": {
+                "kind": "confluence_attachment",
+                "page_id": "22824730",
+                "attachment_id": "132360786",
+                "filename": self.attachment_filename,
+                "updated_at": "2026-07-20T17:06:07+08:00",
+                "sha256": "a" * 64,
+                "sheet": "计算负荷用-2026-7月",
+            },
             "mapping": [
                 {
                     "row": 2,
@@ -52,6 +62,23 @@ class FakeMappingRefresher:
             ],
             "person_projects": {"测试人员": ["G/AM963D5"]},
             "all_people": ["测试人员"],
+            "all_chips": ["AM963D5"],
+            "authorization_retention": {
+                "policy_version": 1,
+                "grace_months": 2,
+                "month_semantics": "removal_month_plus_two_full_calendar_months",
+                "records": [
+                    {
+                        "person": "旧测试人员",
+                        "chip": "MT9612",
+                        "canonical_chip": "MT9612",
+                        "removed_month": "2026-07",
+                        "valid_through_month": "2026-09",
+                        "last_present_source": {"kind": "offline_fixture"},
+                        "removed_by_source": {"kind": "offline_fixture"},
+                    }
+                ],
+            },
         }
 
     def __call__(self, mapping_path):
@@ -163,6 +190,16 @@ class RefreshDashboardTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary.name)
         self.old_mapping = {
+            "schema_version": 3,
+            "source": {
+                "kind": "confluence_attachment",
+                "page_id": "22824730",
+                "attachment_id": "120000001",
+                "filename": "团队成员项目负荷_新拆分-20260703.xlsx",
+                "updated_at": "2026-07-03T10:00:00+08:00",
+                "sha256": "b" * 64,
+                "sheet": "计算负荷用-2026-7月",
+            },
             "mapping": [
                 {
                     "row": 2,
@@ -176,6 +213,13 @@ class RefreshDashboardTests(unittest.TestCase):
             ],
             "person_projects": {"旧测试人员": ["A/MT9612"]},
             "all_people": ["旧测试人员"],
+            "all_chips": ["MT9612"],
+            "authorization_retention": {
+                "policy_version": 1,
+                "grace_months": 2,
+                "month_semantics": "removal_month_plus_two_full_calendar_months",
+                "records": [],
+            },
         }
         (self.project / refresh.MAPPING_NAME).write_text(
             json.dumps(self.old_mapping, ensure_ascii=False, indent=2) + "\n",
@@ -337,6 +381,10 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertEqual(
             self.mapping_refresher.payload["person_projects"],
             published_mapping["person_projects"],
+        )
+        self.assertEqual(
+            self.mapping_refresher.payload["authorization_retention"],
+            published_mapping["authorization_retention"],
         )
         self.assertIn("staged new dashboard", (self.project / refresh.DASHBOARD_NAME).read_text(encoding="utf-8"))
         self.assertFalse((self.project / "srdpm_daily_data_20260701_20260731.json").exists())

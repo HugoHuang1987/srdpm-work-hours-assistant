@@ -512,6 +512,136 @@ def load_and_update_chip_history(person_projects, current_chips=None):
     return sorted(merged)
 
 
+def _validated_month_label(value):
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}', value):
+        raise ValueError('授权宽限月份格式异常')
+    year, month = (int(part) for part in value.split('-'))
+    if year < 2000 or year > 2200 or month < 1 or month > 12:
+        raise ValueError('授权宽限月份无效')
+    return year, month
+
+
+def _month_plus(value, offset):
+    year, month = _validated_month_label(value)
+    index = year * 12 + month - 1 + offset
+    return f'{index // 12:04d}-{index % 12 + 1:02d}'
+
+
+def authorization_retention_status(mapping_data, year, month):
+    """按工时月份把历史人员-机芯规则分为合理与过期两类。"""
+
+    if not isinstance(mapping_data, dict):
+        raise ValueError('项目映射格式异常')
+    schema_version = mapping_data.get('schema_version')
+    if schema_version in (None, 2):
+        return {}, {}
+    if schema_version != 3:
+        raise ValueError('项目映射版本不受支持')
+    try:
+        from wiki_project_mapping import (
+            canonical_chip_key,
+            validate_authorization_retention,
+        )
+        validate_authorization_retention(mapping_data)
+    except ImportError as exc:
+        raise ValueError('授权宽限规则组件不可用') from exc
+    retention = mapping_data.get('authorization_retention')
+    if (
+        not isinstance(retention, dict)
+        or retention.get('policy_version') != 1
+        or retention.get('grace_months') != 2
+        or retention.get('month_semantics') != 'removal_month_plus_two_full_calendar_months'
+        or not isinstance(retention.get('records'), list)
+    ):
+        raise ValueError('授权宽限历史格式异常')
+
+    target_month = f'{int(year):04d}-{int(month):02d}'
+    _validated_month_label(target_month)
+    candidates = {}
+    seen = set()
+    for record in retention['records']:
+        if not isinstance(record, dict):
+            raise ValueError('授权宽限记录格式异常')
+        person = record.get('person')
+        chip = record.get('chip')
+        removed_month = record.get('removed_month')
+        valid_through = record.get('valid_through_month')
+        valid_from = record.get('valid_from_month')
+        if (
+            not isinstance(person, str)
+            or not person.strip()
+            or not isinstance(chip, str)
+            or not chip.strip()
+            or record.get('canonical_chip') != canonical_chip_key(chip)
+            or valid_through != _month_plus(removed_month, 2)
+        ):
+            raise ValueError('授权宽限记录内容异常')
+        if valid_from is not None:
+            _validated_month_label(valid_from)
+            if valid_from > removed_month:
+                raise ValueError('授权宽限生效月份晚于撤出月份')
+        key = (person.strip(), record['canonical_chip'], removed_month)
+        if key in seen:
+            raise ValueError('授权宽限记录重复')
+        seen.add(key)
+        normalized = {
+            'chip': chip.strip().upper(),
+            'canonical_chip': record['canonical_chip'],
+            'valid_from_month': valid_from,
+            'removed_month': removed_month,
+            'valid_through_month': valid_through,
+        }
+        permission_key = (person.strip(), record['canonical_chip'])
+        candidates.setdefault(permission_key, []).append(normalized)
+
+    active = {}
+    expired = {}
+    for (person, _canonical), records in candidates.items():
+        applicable = [
+            record for record in records
+            if record['valid_from_month'] is None
+            or target_month >= record['valid_from_month']
+        ]
+        if not applicable:
+            continue
+        still_reasonable = [
+            record for record in applicable
+            if target_month <= record['valid_through_month']
+        ]
+        if still_reasonable:
+            selected = max(
+                still_reasonable,
+                key=lambda item: (item['valid_through_month'], item['removed_month']),
+            )
+            active.setdefault(person, []).append(selected)
+        else:
+            selected = max(
+                applicable,
+                key=lambda item: (item['valid_through_month'], item['removed_month']),
+            )
+            expired.setdefault(person, []).append(selected)
+    for collection in (active, expired):
+        for person in collection:
+            collection[person].sort(
+                key=lambda item: (item['chip'], item['valid_through_month'])
+            )
+    return active, expired
+
+
+def active_authorization_retention(mapping_data, year, month):
+    """返回对指定工时月份仍有效的历史合理规则。"""
+
+    active, _expired = authorization_retention_status(mapping_data, year, month)
+    return active
+
+
+def expired_authorization_retention(mapping_data, year, month):
+    """返回对指定工时月份已经失效但仍保留追溯的历史规则。"""
+
+    _active, expired = authorization_retention_status(mapping_data, year, month)
+    return expired
+
+
 def build_chip_norm(codes):
     result = {}
     for code in codes:
@@ -596,7 +726,8 @@ def match_chip(candidate_tuple, allowed_chips, wiki_chips_norm):
 
 
 def check_project_ownership(person, customer, project_name, chip_candidates, person_projects,
-                            wiki_chips_norm, chip_history=None, chip_history_norm=None):
+                            wiki_chips_norm, chip_history=None, chip_history_norm=None,
+                            grace_records=None, expired_grace_records=None):
     chip_codes = [c[0] for c in chip_candidates]
 
     if person in LEADERS_ANY:
@@ -618,10 +749,21 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
     if not project_name or project_name == '-':
         return True, '无项目名称，跳过', [], [], chip_codes
 
-    if person not in person_projects:
+    grace_for_person = []
+    if grace_records:
+        if not isinstance(grace_records, dict):
+            raise ValueError('授权宽限记录格式异常')
+        grace_for_person = grace_records.get(person, [])
+    expired_for_person = []
+    if expired_grace_records:
+        if not isinstance(expired_grace_records, dict):
+            raise ValueError('历史过期规则格式异常')
+        expired_for_person = expired_grace_records.get(person, [])
+
+    if person not in person_projects and not grace_for_person and not expired_for_person:
         return False, f'{person} 不在项目负荷映射中', [], [], chip_codes
 
-    allowed = person_projects[person]
+    allowed = person_projects.get(person, [])
     allowed_chips = [_split_project_mapping_entry(c)[1] for c in allowed]
 
     matching_candidates = select_chip_candidates_for_matching(chip_candidates)
@@ -634,6 +776,34 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
     if matched:
         return True, f'匹配到机芯: {", ".join(matched)}', matched, allowed_chips, chip_codes
 
+    grace_chips = []
+    grace_expiries = {}
+    for record in grace_for_person:
+        if not isinstance(record, dict):
+            raise ValueError('授权宽限记录格式异常')
+        chip = str(record.get('chip', '')).strip().upper()
+        valid_through = str(record.get('valid_through_month', '')).strip()
+        if not chip or not valid_through:
+            raise ValueError('授权宽限记录内容异常')
+        if chip not in grace_chips:
+            grace_chips.append(chip)
+        grace_expiries[chip] = max(valid_through, grace_expiries.get(chip, ''))
+
+    grace_matched = []
+    for cand in matching_candidates:
+        matched_chip = match_chip(cand, grace_chips, wiki_chips_norm)
+        if matched_chip and matched_chip not in grace_matched:
+            grace_matched.append(matched_chip)
+    combined_allowed_chips = allowed_chips + [
+        chip for chip in grace_chips if chip not in allowed_chips
+    ]
+    if grace_matched:
+        valid_through = max(grace_expiries[chip] for chip in grace_matched)
+        return True, (
+            f'匹配到两个月宽限机芯: {", ".join(grace_matched)}；'
+            f'有效至 {valid_through}'
+        ), grace_matched, combined_allowed_chips, chip_codes
+
     if not chip_candidates:
         allowed_customers = [
             _split_project_mapping_entry(c)[0]
@@ -641,7 +811,31 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
             if _split_project_mapping_entry(c)[0]
         ]
         if customer in allowed_customers:
-            return True, f'客户 {customer} 匹配', [], allowed_chips, chip_codes
+            return True, f'客户 {customer} 匹配', [], combined_allowed_chips, chip_codes
+
+    expired_chips = []
+    expired_at = {}
+    for record in expired_for_person:
+        if not isinstance(record, dict):
+            raise ValueError('历史过期规则格式异常')
+        chip = str(record.get('chip', '')).strip().upper()
+        valid_through = str(record.get('valid_through_month', '')).strip()
+        if not chip or not valid_through:
+            raise ValueError('历史过期规则内容异常')
+        if chip not in expired_chips:
+            expired_chips.append(chip)
+        expired_at[chip] = max(valid_through, expired_at.get(chip, ''))
+    expired_matches = []
+    for cand in matching_candidates:
+        expired_chip = match_chip(cand, expired_chips, wiki_chips_norm)
+        if expired_chip and expired_chip not in expired_matches:
+            expired_matches.append(expired_chip)
+    if expired_matches:
+        latest_expiry = max(expired_at[chip] for chip in expired_matches)
+        return False, (
+            f'匹配到历史过期机芯: {", ".join(expired_matches)}；'
+            f'两个月宽限已于 {latest_expiry} 到期'
+        ), [], combined_allowed_chips, chip_codes
 
     historical_matches = []
     if chip_history and chip_history_norm:
@@ -652,10 +846,10 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
     if historical_matches:
         return False, (
             f'识别到历史机芯: {", ".join(historical_matches)}；'
-            f'但不在当前允许范围（允许: {", ".join(allowed)}）'
-        ), [], allowed_chips, chip_codes
+            f'但不在当前允许范围或有效宽限范围（允许: {", ".join(allowed + grace_chips)}）'
+        ), [], combined_allowed_chips, chip_codes
 
-    return False, f'项目归属待确认（允许: {", ".join(allowed)}）', [], allowed_chips, chip_codes
+    return False, f'项目归属待确认（允许: {", ".join(allowed + grace_chips)}）', [], combined_allowed_chips, chip_codes
 
 
 def run_audit(year, month, fetch_result):
@@ -678,12 +872,31 @@ def run_audit(year, month, fetch_result):
     if current_wiki_chips is None:
         current_wiki_chips = sorted(_chip_codes_from_person_projects(person_projects))
 
-    # 历史机芯只用于识别和解释，不参与当前人员授权判定。
+    # 历史规则按工时所属月份分为“合理宽限”和“已经过期”；当前授权
+    # 始终保持最新 Wiki 的严格快照。
+    grace_records, expired_grace_records = authorization_retention_status(
+        mapping_data, year, month
+    )
+
+    # 历史机芯只用于识别和解释，不参与当前人员授权判定。先校验完人员
+    # 授权宽限历史，再允许历史机芯库在暂存目录中追加。
     chip_history = load_and_update_chip_history(person_projects, current_wiki_chips)
     chip_history_norm = build_chip_norm(chip_history)
+    grace_chips = sorted({
+        record['chip']
+        for records in grace_records.values()
+        for record in records
+    })
+    expired_grace_chips = sorted({
+        record['chip']
+        for records in expired_grace_records.values()
+        for record in records
+    })
 
-    # 构建 Wiki 机芯规范化映射
-    wiki_chips_norm = build_chip_norm(current_wiki_chips)
+    # 历史机芯即使已从最新表删除，也必须可被解释；只有合理宽限项放行。
+    wiki_chips_norm = build_chip_norm(
+        list(current_wiki_chips) + grace_chips + expired_grace_chips
+    )
 
     daily_data = fetch_result['daily_data']
     all_users = fetch_result['all_users']
@@ -885,7 +1098,9 @@ def run_audit(year, month, fetch_result):
 
                 ok, reason, matched, allowed, chip_codes = check_project_ownership(
                     person, customer_norm, project_name, chip_candidates,
-                    person_projects, wiki_chips_norm, chip_history, chip_history_norm)
+                    person_projects, wiki_chips_norm, chip_history, chip_history_norm,
+                    grace_records=grace_records,
+                    expired_grace_records=expired_grace_records)
 
                 issue_key = (date_str, person, items, project_name, title)
                 if issue_key in seen_issues:

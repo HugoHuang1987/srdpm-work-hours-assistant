@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "source": {
     "kind": "confluence_attachment",
     "page_id": "22824730",
@@ -417,5 +417,69 @@
     "MT9603L",
     "MT9676",
     "MT9690"
-  ]
+  ],
+  "authorization_retention": {
+    "policy_version": 1,
+    "grace_months": 2,
+    "month_semantics": "removal_month_plus_two_full_calendar_months",
+    "records": [
+      {
+        "person": "罗咏珊",
+        "chip": "MT9026L",
+        "canonical_chip": "MT9026L",
+        "removed_month": "2026-07",
+        "valid_through_month": "2026-09",
+        "last_present_source": {
+          "kind": "legacy_mapping",
+          "reference": "git:30cb465",
+          "filename": "团队成员项目负荷_新拆分-20260703.xlsx"
+        },
+        "removed_by_source": {
+          "kind": "confluence_attachment",
+          "attachment_id": "132360786",
+          "filename": "团队成员项目负荷_新拆分-20260720.xlsx",
+          "updated_at": "2026-07-20T17:06:07.730+08:00",
+          "sha256": "810f7fa9d645c27828d9fa27a4cb6066875da5cb711400a446980ad795d83fdd"
+        }
+      },
+      {
+        "person": "陈泽钦",
+        "chip": "AM963D5",
+        "canonical_chip": "AM963D5",
+        "removed_month": "2026-07",
+        "valid_through_month": "2026-09",
+        "last_present_source": {
+          "kind": "legacy_mapping",
+          "reference": "git:30cb465",
+          "filename": "团队成员项目负荷_新拆分-20260703.xlsx"
+        },
+        "removed_by_source": {
+          "kind": "confluence_attachment",
+          "attachment_id": "132360786",
+          "filename": "团队成员项目负荷_新拆分-20260720.xlsx",
+          "updated_at": "2026-07-20T17:06:07.730+08:00",
+          "sha256": "810f7fa9d645c27828d9fa27a4cb6066875da5cb711400a446980ad795d83fdd"
+        }
+      },
+      {
+        "person": "陈泽钦",
+        "chip": "MT9603L",
+        "canonical_chip": "MT9603L",
+        "removed_month": "2026-07",
+        "valid_through_month": "2026-09",
+        "last_present_source": {
+          "kind": "legacy_mapping",
+          "reference": "git:30cb465",
+          "filename": "团队成员项目负荷_新拆分-20260703.xlsx"
+        },
+        "removed_by_source": {
+          "kind": "confluence_attachment",
+          "attachment_id": "132360786",
+          "filename": "团队成员项目负荷_新拆分-20260720.xlsx",
+          "updated_at": "2026-07-20T17:06:07.730+08:00",
+          "sha256": "810f7fa9d645c27828d9fa27a4cb6066875da5cb711400a446980ad795d83fdd"
+        }
+      }
+    ]
+  }
 }

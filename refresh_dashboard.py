@@ -293,6 +293,12 @@ def _validate_staged_mapping(path: Path) -> None:
         for person, entries in person_projects.items()
     ):
         raise RefreshMappingError("Wiki 人员允许机芯范围异常，旧数据未修改")
+    try:
+        from wiki_project_mapping import validate_authorization_retention
+
+        validate_authorization_retention(payload)
+    except Exception as exc:
+        raise RefreshMappingError("Wiki 授权宽限历史异常，旧数据未修改") from exc
 
 
 def _clear_staged_month_artifacts(stage_archive: Path, month: str) -> None:
