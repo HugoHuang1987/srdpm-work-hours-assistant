@@ -666,7 +666,9 @@ class ApprovalService:
                 "started_at": None,
                 "finished_at": None,
                 "updated_month": None,
-                "message": "等待读取当前自然月和前一个自然月 SRDPM 数据",
+                "updated_months": [],
+                "mapping_updated": None,
+                "message": "等待检查 Wiki 允许机芯并读取当前自然月和前一个自然月 SRDPM 数据",
             }
             self._refresh_jobs[job_id] = job
             self._refresh_active = True
@@ -693,14 +695,21 @@ class ApprovalService:
         """Map refresh errors to safe browser-facing messages only."""
 
         try:
-            from refresh_dashboard import RefreshBusyError, RefreshCredentialError
+            from refresh_dashboard import (
+                RefreshBusyError,
+                RefreshCredentialError,
+                RefreshMappingError,
+            )
         except Exception:  # pragma: no cover - module is part of this project
             RefreshBusyError = ()  # type: ignore[assignment,misc]
             RefreshCredentialError = ()  # type: ignore[assignment,misc]
+            RefreshMappingError = ()  # type: ignore[assignment,misc]
         if isinstance(error, RefreshBusyError):
             return "已有数据刷新或真实审批正在执行，当前看板未修改"
         if isinstance(error, RefreshCredentialError):
             return "未找到可用的 SRDPM 登录凭据，当前看板未修改"
+        if isinstance(error, RefreshMappingError):
+            return "Wiki 最新项目负荷附件检查失败，允许机芯、数据和看板均未修改"
         return "数据刷新失败，现有数据和看板均未修改，请稍后重试"
 
     def _run_refresh_job(self, job_id: str) -> None:
@@ -709,18 +718,35 @@ class ApprovalService:
                 job = self._refresh_jobs[job_id]
                 job["status"] = "running"
                 job["started_at"] = _utc_now_text()
-                job["message"] = "正在读取当前自然月和前一个自然月数据、重新审计并生成看板；不会提交审批"
+                job["message"] = "正在检查 Wiki 最新项目负荷附件，并读取当前自然月和前一个自然月数据；不会提交审批"
 
             result = self.refresh_runner(self.project_dir)
             updated_month = getattr(result, "month", None)
             if not isinstance(updated_month, str) or not MONTH_PATTERN.fullmatch(updated_month):
                 raise RuntimeError("refresh runner returned an invalid month")
+            refreshed_months = getattr(result, "refreshed_months", None)
+            if not refreshed_months:
+                refreshed_months = (updated_month,)
+            if (
+                not isinstance(refreshed_months, (list, tuple))
+                or not refreshed_months
+                or any(
+                    not isinstance(item, str) or not MONTH_PATTERN.fullmatch(item)
+                    for item in refreshed_months
+                )
+                or updated_month not in refreshed_months
+                or len(set(refreshed_months)) != len(refreshed_months)
+            ):
+                raise RuntimeError("refresh runner returned invalid refreshed months")
+            mapping_updated = bool(getattr(result, "mapping_updated", False))
 
             with self._state_lock:
                 job = self._refresh_jobs[job_id]
                 job["status"] = "succeeded"
                 job["updated_month"] = updated_month
-                job["message"] = "数据已刷新，正在重新加载最新看板"
+                job["updated_months"] = list(refreshed_months)
+                job["mapping_updated"] = mapping_updated
+                job["message"] = "允许机芯已核对，数据已刷新，正在重新加载最新看板"
                 job["finished_at"] = _utc_now_text()
         except Exception as exc:
             with self._state_lock:

@@ -5,7 +5,7 @@ param(
     [string]$Action = "Status"
 )
 
-# 管理“每周一 10:00 只刷新、不审批”的当前用户计划任务。
+# 管理“每周一 10:00 只读同步 Wiki、刷新近两月、不审批”的当前用户计划任务。
 # 安装本身只写入 Task Scheduler 配置，绝不立即联网或触发刷新。
 $ErrorActionPreference = "Stop"
 $taskName = "SRDPM-WeeklyDashboardRefresh"
@@ -143,7 +143,7 @@ switch ($Action) {
             -Trigger $definition.Trigger `
             -Settings $definition.Settings `
             -Principal $definition.Principal `
-            -Description "每周一 10:00 仅拉取当前月 SRDPM 数据并刷新本地工时看板；不执行审批。" `
+            -Description "每周一 10:00 只读同步 Wiki 允许机芯，拉取当前月及前一月 SRDPM 数据并刷新本地工时看板；不执行审批。" `
             -Force | Out-Null
         Write-Output "已安装当前用户周一 10:00 刷新任务；安装未触发网络访问。"
     }

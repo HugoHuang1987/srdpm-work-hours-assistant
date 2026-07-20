@@ -439,17 +439,32 @@ def chip_normalize(code):
     return m.group(1), m.group(2), m.group(3) or ''
 
 
+def _split_project_mapping_entry(value):
+    """Return ``(customer, chip)`` without breaking chip aliases containing '/'."""
+    text = str(value or '').strip()
+    if not text:
+        return '', ''
+    # A chip such as MT9603/L contains a slash of its own.  If the value starts
+    # with a recognizable chip prefix, the whole value is the chip-only form.
+    if chip_normalize(text)[0]:
+        return '', text
+    if '/' in text:
+        customer, chip = text.split('/', 1)
+        return customer.strip(), chip.strip()
+    return '', text
+
+
 def _chip_codes_from_person_projects(person_projects):
     """提取当前 Wiki 映射中的机芯代码，不保留人员授权关系。"""
     return {
-        value.split('/')[-1].strip().upper()
+        _split_project_mapping_entry(value)[1].upper()
         for values in person_projects.values()
         for value in values
-        if value.split('/')[-1].strip()
+        if _split_project_mapping_entry(value)[1]
     }
 
 
-def load_and_update_chip_history(person_projects):
+def load_and_update_chip_history(person_projects, current_chips=None):
     """合并当前 Wiki 机芯到只增不减的历史库，并返回全部历史代码。"""
     history_path = Path(OUT_DIR) / CHIP_HISTORY_NAME
     historical = set()
@@ -465,7 +480,15 @@ def load_and_update_chip_history(person_projects):
         raise ValueError(f'机芯历史库包含无效机芯: {history_path}')
     historical.update(code.strip().upper() for code in payload['chips'])
 
-    merged = historical | _chip_codes_from_person_projects(person_projects)
+    if current_chips is None:
+        current = _chip_codes_from_person_projects(person_projects)
+    else:
+        if not isinstance(current_chips, (list, tuple, set)) or any(
+            not isinstance(code, str) or not code.strip() for code in current_chips
+        ):
+            raise ValueError('当前 Wiki 机芯列表格式不合法')
+        current = {code.strip().upper() for code in current_chips}
+    merged = historical | current
     normalized_payload = {
         'schema_version': 1,
         'purpose': '只增不减地记住曾在 Wiki 项目负荷映射中出现过的机芯；不代表当前人员仍有申报权限。',
@@ -492,7 +515,7 @@ def load_and_update_chip_history(person_projects):
 def build_chip_norm(codes):
     result = {}
     for code in codes:
-        pure = code.split('/')[-1].strip().upper()
+        pure = _split_project_mapping_entry(code)[1].upper()
         if not pure:
             continue
         pref, num, suf = chip_normalize(pure)
@@ -526,6 +549,12 @@ def extract_chip_candidates(project_name):
         cand = m.group(1).upper()
         if len(cand) >= 6:
             candidates.append(cand)
+    # Parenthetical chips can follow Chinese text without a whitespace boundary,
+    # for example “新开MT9603L机芯”.  Capture that authoritative suffix too.
+    for m in re.finditer(r'([AMT]{1,2}\d{2,4}[A-Z0-9]*)(?=机芯)', str(project_name), re.I):
+        cand = m.group(1).upper()
+        if len(cand) >= 5:
+            candidates.append(cand)
     for m in re.finditer(r'(?:^|[\s(（])([AMT]{1,2}\d{2,4}[A-Z]?[A-Z0-9]*)(?:$|[\s)）]|[^A-Z0-9]|机芯)', str(project_name)):
         cand = m.group(1).upper()
         if len(cand) >= 5:
@@ -545,15 +574,15 @@ def extract_chip_candidates(project_name):
 def match_chip(candidate_tuple, allowed_chips, wiki_chips_norm):
     cand_code, cand_pref, cand_num, cand_suf = candidate_tuple
     for chip in allowed_chips:
-        chip_pure = chip.split('/')[-1].strip()
+        chip_pure = _split_project_mapping_entry(chip)[1]
         if chip_pure not in wiki_chips_norm:
             continue
         wiki_pref, wiki_num, wiki_suf = wiki_chips_norm[chip_pure]
-        same_963_family = (
+        same_t_am_family = (
             {cand_pref, wiki_pref} == {'AM', 'T'} and
-            cand_num == wiki_num == '963'
+            cand_num == wiki_num
         )
-        if cand_pref == wiki_pref or same_963_family:
+        if cand_pref == wiki_pref or same_t_am_family:
             cand_revision = _explicit_d_revision(cand_suf)
             wiki_revision = _explicit_d_revision(wiki_suf)
             # An explicit project revision must match exactly.  A project code
@@ -593,7 +622,7 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
         return False, f'{person} 不在项目负荷映射中', [], [], chip_codes
 
     allowed = person_projects[person]
-    allowed_chips = [c.split('/')[-1].strip() for c in allowed]
+    allowed_chips = [_split_project_mapping_entry(c)[1] for c in allowed]
 
     matching_candidates = select_chip_candidates_for_matching(chip_candidates)
     matched = []
@@ -606,7 +635,11 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
         return True, f'匹配到机芯: {", ".join(matched)}', matched, allowed_chips, chip_codes
 
     if not chip_candidates:
-        allowed_customers = [c.split('/')[0] for c in allowed if '/' in c]
+        allowed_customers = [
+            _split_project_mapping_entry(c)[0]
+            for c in allowed
+            if _split_project_mapping_entry(c)[0]
+        ]
         if customer in allowed_customers:
             return True, f'客户 {customer} 匹配', [], allowed_chips, chip_codes
 
@@ -641,15 +674,16 @@ def run_audit(year, month, fetch_result):
 
     person_projects = mapping_data['person_projects']
     all_people = mapping_data['all_people']
+    current_wiki_chips = mapping_data.get('all_chips')
+    if current_wiki_chips is None:
+        current_wiki_chips = sorted(_chip_codes_from_person_projects(person_projects))
 
     # 历史机芯只用于识别和解释，不参与当前人员授权判定。
-    chip_history = load_and_update_chip_history(person_projects)
+    chip_history = load_and_update_chip_history(person_projects, current_wiki_chips)
     chip_history_norm = build_chip_norm(chip_history)
 
     # 构建 Wiki 机芯规范化映射
-    wiki_chips_norm = build_chip_norm(
-        set(sum([list(v) for v in person_projects.values()], []))
-    )
+    wiki_chips_norm = build_chip_norm(current_wiki_chips)
 
     daily_data = fetch_result['daily_data']
     all_users = fetch_result['all_users']

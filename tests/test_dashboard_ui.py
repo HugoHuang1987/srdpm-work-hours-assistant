@@ -56,6 +56,7 @@ class DashboardUiTests(unittest.TestCase):
             timeout=10_000,
         )
         self.current_month = self.page.evaluate("currentMonth")
+        self.available_months = self.page.evaluate("MONTHS")
 
     def tearDown(self):
         self.context.close()
@@ -214,6 +215,7 @@ class DashboardUiTests(unittest.TestCase):
                         "job_id": "test-refresh-job-id-1234567890",
                         "status": "succeeded",
                         "updated_month": self.current_month,
+                        "updated_months": [self.current_month],
                         "message": "done",
                     }
                 )
@@ -388,14 +390,30 @@ class DashboardUiTests(unittest.TestCase):
             self.assertEqual(expected_visible, self.page.locator(f"#panel_{key} .table-wrap tbody tr:visible").count(), key)
         self.assert_no_page_errors()
 
-    def test_ui_refresh_uses_read_only_endpoint_and_clears_updated_month_selection(self):
-        requests, _ = self.open_mock_local_service(lambda: {})
+    def test_ui_refresh_uses_read_only_endpoint_and_clears_both_refreshed_months(self):
+        self.assertGreaterEqual(len(self.available_months), 3)
+        previous_month = self.available_months[-2]
+        older_month = self.available_months[-3]
+        requests, _ = self.open_mock_local_service(
+            lambda: {},
+            refresh_job_factory=lambda: {
+                "job_id": "test-refresh-job-id-1234567890",
+                "status": "succeeded",
+                "updated_month": self.current_month,
+                "updated_months": [previous_month, self.current_month],
+                "mapping_updated": True,
+                "message": "done",
+            },
+        )
         group_key = self.page.evaluate(
-            """() => {
+            """months => {
                 const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
-                localStorage.setItem(getStorageKey(currentMonth), JSON.stringify({[group.group_key]: 'selected'}));
+                months.forEach(month => {
+                    localStorage.setItem(getStorageKey(month), JSON.stringify({[group.group_key]: 'selected'}));
+                });
                 return group.group_key;
-            }"""
+            }""",
+            [older_month, previous_month, self.current_month],
         )
 
         with self.page.expect_navigation(wait_until="domcontentloaded", timeout=10_000):
@@ -418,6 +436,12 @@ class DashboardUiTests(unittest.TestCase):
         self.assertFalse(any("/credentials/" in item["path"] for item in requests))
         self.assertIsNone(
             self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{self.current_month}")
+        )
+        self.assertIsNone(
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{previous_month}")
+        )
+        self.assertIsNotNone(
+            self.page.evaluate("key => localStorage.getItem(key)", f"srdpm_approval_v3_{older_month}")
         )
         self.assertNotEqual("", group_key)
         self.assert_no_page_errors()
@@ -664,6 +688,31 @@ class DashboardUiTests(unittest.TestCase):
         self.assert_no_page_errors()
 
     def test_platform_selected_rows_can_be_cancelled_in_platform_view(self):
+        self.page.evaluate(
+            """() => {
+                CAT_DATA = {
+                    one: {title: '一、漏报人员', items: []},
+                    two: {title: '二、请假', items: []},
+                    three: {title: '三、工时异常', items: []},
+                    four: {title: '四、项目归属异常', items: []},
+                    five: {title: '五、公共事务/平台类', items: [
+                        {date: '2026-07-01', person: '平台甲', project: 'P1', title: '', content: '', hours: 1, approval_group_key: 'platform-one'},
+                        {date: '2026-07-02', person: '平台乙', project: 'P2', title: '', content: '', hours: 1, approval_group_key: 'platform-two'}
+                    ]},
+                    six: {title: '六、正常申报', items: []},
+                    seven: {title: '七、其他待定', items: []}
+                };
+                APPROVAL_GROUPS = {
+                    'platform-one': {group_key: 'platform-one', review_mode: 'auto', approve_ids: ['p1']},
+                    'platform-two': {group_key: 'platform-two', review_mode: 'auto', approve_ids: ['p2']}
+                };
+                approvalState = {};
+                resetAllPageState();
+                currentCatKey = 'five';
+                renderCategoryNav();
+                switchTab('five');
+            }"""
+        )
         expected_auto_selected = self.page.evaluate(
             """() => Object.values(APPROVAL_GROUPS).filter(group =>
                 group.review_mode === 'auto' && getGroupStatus(group.group_key) !== 'approved'

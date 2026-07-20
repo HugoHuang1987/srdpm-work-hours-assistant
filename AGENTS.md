@@ -13,17 +13,18 @@
 
 唯一主链为：
 
-1. `fetch_and_audit.py`：拉取数据并生成离线审计结果。
-2. `srdpm_archive/YYYY-MM/`：保存本地原始数据和审计结果；该目录是敏感运行数据，不属于源码。
-3. `build_multi_month_dashboard.py`：读取审计结果并生成多月看板。
-4. `工时审批看板_多月.html`：供本地查看、选择和辅助审核的生成页面。
-5. `local_approval_server.py`：仅监听 `127.0.0.1`，同源托管看板并在用户确认后桥接真实审批。
+1. `wiki_project_mapping.py`：只读检查固定 Wiki 页面 22824730 的最新日期版项目负荷附件，严格校验后生成当前授权映射。
+2. `fetch_and_audit.py`：拉取数据并基于当前授权映射生成离线审计结果。
+3. `srdpm_archive/YYYY-MM/`：保存本地原始数据和审计结果；该目录是敏感运行数据，不属于源码。
+4. `build_multi_month_dashboard.py`：读取审计结果并生成多月看板。
+5. `工时审批看板_多月.html`：供本地查看、选择和辅助审核的生成页面。
+6. `local_approval_server.py`：仅监听 `127.0.0.1`，同源托管看板并在用户确认后桥接真实审批。
 
 `audit_june.py`、旧看板生成器、API 探测脚本及批量审批脚本均为历史参考，不得重新接入主链，除非先完成安全重构和回归验证。
 
 ## 凭据与数据安全
 
-- 命令行执行器只从环境变量 `SRDPM_USERNAME` 和 `SRDPM_PASSWORD` 读取凭据；后台 UI 服务允许使用当前 Windows 用户的 Credential Manager 固定 Generic Credential `SRDPM.WorkHoursAssistant`。禁止任何明文文件持久化。
+- 命令行执行器只从环境变量 `SRDPM_USERNAME` 和 `SRDPM_PASSWORD` 读取凭据；后台 UI 服务允许使用当前 Windows 用户的 Credential Manager 固定 Generic Credential `SRDPM.WorkHoursAssistant`。Wiki 附件读取只允许使用当前用户环境变量 `IDISPLAYVISION_WIKI_PAT`，不得进入页面、请求体、任务参数或文件。禁止任何明文文件持久化。
 - 禁止在源码、Markdown、JSON、日志、测试夹具、生成 HTML或聊天中写入、输出或复制真实密码、Cookie、token、PAT、Authorization header 或其他凭据。
 - 禁止读取或提交旧凭据 JSON。发现历史凭据时只报告文件路径和风险，不显示值，并建议轮换。
 - `raw_data`、`srdpm_archive/`、员工工时内容、审核报告、截图、抓包页面、凭据 JSON 和审批日志只能保存在本机，不得提交版本库。
@@ -46,8 +47,9 @@
 - `file://` 页面只能通过顶层导航把 `month + group_keys` 放入 localhost URL fragment；后台服务消费后必须立即清除 fragment，并以转交选择完整替换 localhost 旧选择。凭据不得进入 URL、storage、HTML、日志或反馈。
 - 提交调用抛异常时必须先只读回查，不能自动重提；只有逐 ID 回读为“通过”才能标记成功，其余必须区分 `not_attempted` 与 `unknown`。
 - 后台常驻服务的 execute 不能只信任浏览器确认；服务端必须在创建任务前显示 Windows 原生安全确认，默认选择“否”，并同时展示与网页清单一致的摘要哈希前缀。取消、弹窗不可用或摘要漂移都必须在创建客户端前停止。
-- 每周一 10:00 计划任务只能调用 `refresh_dashboard.py` 进行只读抓取、审计和页面刷新；不得调用审批、驳回、`apply_approval_plan.py` 或任何 `--execute`。刷新应使用 Credential Manager、暂存发布、刷新锁和失败保持旧页面。
-- 页面“重新读取当前月数据”也只能经同源本机服务调用固定的 `refresh_dashboard.refresh_current_month(project_dir=...)`；接口只接受精确空 JSON `{}`，不得接收页面提供的月份、路径、凭据、审批 ID 或脚本名。刷新期间必须拒绝新的 prepare/execute，成功后清除刷新月份的旧浏览器选择并重载页面；`file://` 页面不得用 URL fragment 自动触发带凭据刷新。
+- 每周一 10:00 计划任务只能调用 `refresh_dashboard.py`，先对固定 Wiki 页面做只读附件检查，再对 SRDPM 当前月和前一月进行只读抓取、审计和页面刷新；不得调用审批、驳回、`apply_approval_plan.py` 或任何 `--execute`。刷新应使用 Credential Manager、暂存发布、刷新锁和失败保持旧页面。
+- 页面“同步 Wiki 并读取近两月”也只能经同源本机服务调用固定的 `refresh_dashboard.refresh_current_month(project_dir=...)`；接口只接受精确空 JSON `{}`，不得接收页面提供的月份、路径、Wiki URL、附件 ID、凭据、审批 ID 或脚本名。刷新期间必须拒绝新的 prepare/execute，成功后清除实际刷新两个月的旧浏览器选择并重载页面；`file://` 页面不得用 URL fragment 自动触发带凭据刷新。
+- Wiki 更新必须选择文件名符合 `团队成员项目负荷_新拆分-YYYYMMDD.xlsx` 的最新附件，只读取与附件年月一致且唯一的 `计算负荷用-YYYY-M月` 工作表；必须校验可信 HTTPS 主机及 `/wiki/download/attachments/` 路径、API 文件大小、PK/XLSX 必需结构、A/B/D/I/M/O 表头、`负荷说明` 终止行和合并单元格。最新附件无效时禁止退回旧附件继续刷新。
 
 ## 统计与状态语义
 
@@ -55,7 +57,7 @@
 - “可审批候选”“已选择”“已提交”“SRDPM 已审批”必须是不同状态；候选不等于定时自动审批，禁止用 `localStorage` 的本地标记冒充服务器状态。
 - 分类导航 1-7 的颜色只反映是否仍有待处理项：有则橙色、无则绿色；第一类按漏报人员存在与否判断，第七类必须包含原始数据中未被 1-6 类覆盖的待审明细，并且仅作信息展示，绝不生成审批选择或审批 ID。
 - 第零类“汇总信息”必须直接从原始明细按稳定 ID 去重计算，不得把第三类整日异常与第四/六类明细相加；请假类与平台类各自单列，其余按机芯汇总，并让人员、分类/机芯多选共同约束矩阵和合计。
-- `project_mapping.json` 只表示当前 Wiki 授权；`chip_history.json` 是不含人员权限、只增不减的历史机芯注册表。任何 Wiki 更新都只能向历史库追加机芯，禁止因当前表删除而移除旧机芯；历史机芯可以被识别，但不自动恢复旧授权。历史库缺失或损坏时必须停止刷新。`T963` 与 `AM963` 是同一机芯家族，但明确的 `D4`、`D5` 是完全不同的版本，必须优先读取项目名中的显式版本且绝不得互相匹配。
+- `project_mapping.json` 只表示最新 Wiki 当月表的当前授权；`chip_history.json` 是不含人员权限、只增不减的历史机芯注册表。任何 Wiki 更新都只能向历史库追加机芯，禁止因当前表删除而移除旧机芯；历史机芯可以被识别，但不自动恢复旧授权。历史库缺失或损坏时必须停止刷新。Wiki 映射、近两月归档、历史机芯和生成页面必须在同一次暂存/回滚事务中发布。`T` 与 `AM` 前缀在数字主体相同时按同一机芯家族匹配，但明确的 `D4`、`D5` 是完全不同的版本，必须优先读取项目名中的显式版本且绝不得互相匹配。
 - 月份选择器按时间升序展示，支持单月、任意多月和全选；多月视图必须按所选归档合并并严格只读，禁止审批和当前月刷新操作，不得把未成功加载的历史月份伪装成有数据的月份。
 - UI 状态必须绑定稳定业务 ID，不得使用数组下标作为持久化键。
 - SRDPM 父记录 `id` 是每天变化的审批记录 ID，不是人员 `user_id`；只有明确的 `uid/user_id` 才能用于严格人员匹配。缺失时允许姓名兼容查询，但必须继续执行待审 ID 全等校验；出现同名人员时禁止直批，直到取得稳定人员标识。

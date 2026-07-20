@@ -99,6 +99,54 @@ class ChipHistoryTests(unittest.TestCase):
         )
         self.assertFalse(wrong_revision_ok)
 
+    def test_verified_t966_alias_matches_am966_with_same_explicit_revision(self):
+        title = (
+            "预研 55D6500 1AM966B6S2AT FTV CSOT TV 预研项目 "
+            "（T966D5机芯）"
+        )
+        candidates = audit.extract_chip_candidates(title)
+        selected = audit.select_chip_candidates_for_matching(candidates)
+        norm = audit.build_chip_norm(["AM966D5", "AM966D4"])
+
+        self.assertEqual(["T966D5"], [candidate[0] for candidate in selected])
+        self.assertEqual("AM966D5", audit.match_chip(selected[0], ["AM966D5"], norm))
+        self.assertIsNone(audit.match_chip(selected[0], ["AM966D4"], norm))
+
+        t950d5 = ("T950D5",) + audit.chip_normalize("T950D5")
+        norm_950 = audit.build_chip_norm(["AM950D5", "AM950D4"])
+        self.assertEqual("AM950D5", audit.match_chip(t950d5, ["AM950D5"], norm_950))
+        self.assertIsNone(audit.match_chip(t950d5, ["AM950D4"], norm_950))
+
+    def test_chip_immediately_after_chinese_text_is_extracted(self):
+        candidates = audit.extract_chip_candidates(
+            "预研项目（新开MT9603L机芯匹配D3200模具）"
+        )
+        self.assertIn("MT9603L", [candidate[0] for candidate in candidates])
+
+    def test_chip_alias_with_slash_is_not_mistaken_for_customer_separator(self):
+        allowed = ["预研/MT9603/L"]
+        norm = audit.build_chip_norm(["MT9603/L"])
+        candidate = ("MT9603",) + audit.chip_normalize("MT9603")
+
+        self.assertEqual("MT9603/L", audit.match_chip(candidate, allowed, norm))
+        self.assertEqual({"MT9603/L"}, audit._chip_codes_from_person_projects({"测试人员": allowed}))
+
+    def test_current_unassigned_wiki_chip_is_still_added_to_history(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            history_path = root / audit.CHIP_HISTORY_NAME
+            history_path.write_text(
+                json.dumps({"schema_version": 1, "chips": ["T963D4Z"]}),
+                encoding="utf-8",
+            )
+            with patch.object(audit, "OUT_DIR", str(root)):
+                history = audit.load_and_update_chip_history(
+                    {"测试人员": ["G/AM963"]},
+                    ["AM963", "MT9690"],
+                )
+
+            self.assertEqual(["AM963", "MT9690", "T963D4Z"], history)
+
     def test_missing_history_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             with patch.object(audit, "OUT_DIR", temporary_dir):

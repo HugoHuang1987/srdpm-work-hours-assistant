@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import fetch_and_audit
@@ -31,6 +32,45 @@ class FakeCredentialStore:
         return self.credentials
 
 
+class FakeMappingRefresher:
+    def __init__(self):
+        self.calls = []
+        self.before_refresh = None
+        self.fail = False
+        self.attachment_filename = "团队成员项目负荷_新拆分-20260720.xlsx"
+        self.payload = {
+            "mapping": [
+                {
+                    "row": 2,
+                    "customer": "G",
+                    "project": "离线测试项目",
+                    "chip": "AM963D5",
+                    "spm": "测试人员",
+                    "bsp": "",
+                    "diag": "",
+                }
+            ],
+            "person_projects": {"测试人员": ["G/AM963D5"]},
+            "all_people": ["测试人员"],
+        }
+
+    def __call__(self, mapping_path):
+        mapping_path = Path(mapping_path)
+        self.calls.append(mapping_path)
+        if callable(self.before_refresh):
+            self.before_refresh()
+        if self.fail:
+            raise RuntimeError("offline wiki mapping failure")
+        mapping_path.write_text(
+            json.dumps(self.payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            updated=True,
+            attachment_filename=self.attachment_filename,
+        )
+
+
 class FakeSession:
     def __init__(self):
         self.closed = False
@@ -51,6 +91,7 @@ class FakeFetchModule:
         self.session = FakeSession()
         self.fail_fetch = False
         self.fail_audit = False
+        self.return_none_audit = False
 
     def login_srdpm(self, username, password):
         self.login_inputs.append((username, password))
@@ -85,6 +126,8 @@ class FakeFetchModule:
         self.audit_inputs.append((year, month, fetch_result, self.OUT_DIR))
         if self.fail_audit:
             raise RuntimeError("offline audit failure")
+        if self.return_none_audit:
+            return None
         month_dir = Path(fetch_result["month_dir"])
         month_label = f"{year:04d}-{month:02d}"
         (month_dir / "audit_report.json").write_text(
@@ -119,19 +162,48 @@ class RefreshDashboardTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary.name)
-        (self.project / "project_mapping.json").write_text("{}", encoding="utf-8")
+        self.old_mapping = {
+            "mapping": [
+                {
+                    "row": 2,
+                    "customer": "A",
+                    "project": "旧项目",
+                    "chip": "MT9612",
+                    "spm": "旧测试人员",
+                    "bsp": "",
+                    "diag": "",
+                }
+            ],
+            "person_projects": {"旧测试人员": ["A/MT9612"]},
+            "all_people": ["旧测试人员"],
+        }
+        (self.project / refresh.MAPPING_NAME).write_text(
+            json.dumps(self.old_mapping, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         (self.project / refresh.CHIP_HISTORY_NAME).write_text(
             '{"schema_version":1,"chips":["T963D4Z"]}', encoding="utf-8"
         )
         self.month = "2026-07"
+        self.previous_month = "2026-06"
         self.month_dir = self.project / "srdpm_archive" / self.month
-        self.month_dir.mkdir(parents=True)
-        (self.month_dir / "raw_data.json").write_text('{"old":"raw"}', encoding="utf-8")
-        (self.month_dir / "audit_report.json").write_text(
-            '{"old":"audit"}', encoding="utf-8"
-        )
-        (self.month_dir / "audit_report.md").write_text("old audit", encoding="utf-8")
+        self.previous_month_dir = self.project / "srdpm_archive" / self.previous_month
+        for month_dir, label in (
+            (self.previous_month_dir, self.previous_month),
+            (self.month_dir, self.month),
+        ):
+            month_dir.mkdir(parents=True)
+            (month_dir / "raw_data.json").write_text(
+                json.dumps({"old": f"raw-{label}"}), encoding="utf-8"
+            )
+            (month_dir / "audit_report.json").write_text(
+                json.dumps({"old": f"audit-{label}"}), encoding="utf-8"
+            )
+            (month_dir / "audit_report.md").write_text(
+                f"old audit {label}", encoding="utf-8"
+            )
         (self.project / refresh.DASHBOARD_NAME).write_text("<html>old</html>", encoding="utf-8")
+        self.mapping_refresher = FakeMappingRefresher()
         self.fetch = FakeFetchModule()
         self.dashboard = FakeDashboardModule()
         self.credentials = Credentials("offline-user", "offline-password")
@@ -145,8 +217,11 @@ class RefreshDashboardTests(unittest.TestCase):
 
     def _snapshot_published_files(self):
         paths = [
-            self.month_dir / name for name in refresh.REQUIRED_MONTH_ARTIFACTS
+            month_dir / name
+            for month_dir in (self.previous_month_dir, self.month_dir)
+            for name in refresh.REQUIRED_MONTH_ARTIFACTS
         ] + [
+            self.project / refresh.MAPPING_NAME,
             self.project / refresh.CHIP_HISTORY_NAME,
             self.project / refresh.DASHBOARD_NAME,
         ]
@@ -159,6 +234,7 @@ class RefreshDashboardTests(unittest.TestCase):
             "credential_store": self.store,
             "fetch_module": self.fetch,
             "dashboard_module": self.dashboard,
+            "mapping_refresher": self.mapping_refresher,
             "lock_factory": lambda: self.lock,
             "execution_lock_factory": lambda: self.execution_lock,
         }
@@ -197,6 +273,7 @@ class RefreshDashboardTests(unittest.TestCase):
             return original_dashboard()
 
         self.store.before_load = lambda: observe("credentials")
+        self.mapping_refresher.before_refresh = lambda: observe("mapping")
         self.fetch.login_srdpm = observe_login
         self.fetch.fetch_month = observe_fetch
         self.fetch.run_audit = observe_audit
@@ -212,7 +289,10 @@ class RefreshDashboardTests(unittest.TestCase):
             result = self._refresh()
 
         self.assertEqual(self.month, result.month)
-        self.assertEqual(8, len(result.published_paths))
+        self.assertEqual((self.previous_month, self.month), result.refreshed_months)
+        self.assertTrue(result.mapping_updated)
+        self.assertEqual(9, len(result.published_paths))
+        self.assertIn(self.project / refresh.MAPPING_NAME, result.published_paths)
         self.assertEqual(
             [("offline-user", "offline-password"), ("offline-user", "offline-password")],
             self.fetch.login_inputs,
@@ -228,25 +308,36 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertTrue(self.lock.released)
         self.assertTrue(self.execution_lock.released)
         self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
+        observed_stages = [stage for stage, _locked in lock_observations]
+        self.assertTrue(all(locked for _stage, locked in lock_observations))
+        self.assertIn("mapping", observed_stages)
+        self.assertLess(observed_stages.index("mapping"), observed_stages.index("login"))
         self.assertEqual(
-            [
-                ("credentials", True),
-                ("login", True),
-                ("fetch", True),
-                ("audit", True),
-                ("login", True),
-                ("fetch", True),
-                ("audit", True),
-                ("dashboard", True),
-            ],
-            lock_observations,
+            ["login", "fetch", "audit", "login", "fetch", "audit", "dashboard"],
+            [stage for stage in observed_stages if stage not in {"credentials", "mapping"}],
         )
+        self.assertEqual(1, len(self.mapping_refresher.calls))
+        staged_mapping = self.mapping_refresher.calls[0]
+        self.assertEqual(refresh.MAPPING_NAME, staged_mapping.name)
+        self.assertNotEqual(self.project / refresh.MAPPING_NAME, staged_mapping)
+        self.assertTrue(staged_mapping.parent.name.startswith(".srdpm-refresh-stage-"))
         self.assertEqual(1, len(lock_payloads))
         self.assertEqual({"schema_version", "pid", "created_at"}, set(lock_payloads[0]))
         self.assertNotIn("offline-password", json.dumps(lock_payloads[0]))
         self.assertIn('"daily_data": {}', (self.month_dir / "raw_data.json").read_text(encoding="utf-8"))
         self.assertIn('"month": "2026-07"', (self.month_dir / "audit_report.json").read_text(encoding="utf-8"))
         self.assertEqual("# staged audit\n", (self.month_dir / "audit_report.md").read_text(encoding="utf-8"))
+        self.assertIn(
+            '"month": "2026-06"',
+            (self.previous_month_dir / "audit_report.json").read_text(encoding="utf-8"),
+        )
+        published_mapping = json.loads(
+            (self.project / refresh.MAPPING_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            self.mapping_refresher.payload["person_projects"],
+            published_mapping["person_projects"],
+        )
         self.assertIn("staged new dashboard", (self.project / refresh.DASHBOARD_NAME).read_text(encoding="utf-8"))
         self.assertFalse((self.project / "srdpm_daily_data_20260701_20260731.json").exists())
         self.assertFalse((self.project / "审核报告_2026年7月.json").exists())
@@ -271,6 +362,21 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
         self.assertTrue(self.lock.released)
 
+    def test_wiki_mapping_failure_keeps_every_published_file(self):
+        before = self._snapshot_published_files()
+        self.mapping_refresher.fail = True
+
+        with self.assertRaises(refresh.RefreshError):
+            self._refresh()
+
+        self.assertEqual(before, self._snapshot_published_files())
+        self.assertEqual([], self.fetch.login_inputs)
+        self.assertEqual([], self.fetch.fetch_inputs)
+        self.assertEqual([], self.dashboard.calls)
+        self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
+        self.assertTrue(self.lock.released)
+        self.assertTrue(self.execution_lock.released)
+
     def test_fetch_failure_keeps_old_archive_and_dashboard(self):
         before = self._snapshot_published_files()
         lock_seen = []
@@ -291,6 +397,21 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertEqual([True], lock_seen)
         self.assertTrue(self.execution_lock.released)
 
+    def test_audit_returning_none_cannot_reuse_stale_staged_report(self):
+        before = self._snapshot_published_files()
+        self.fetch.return_none_audit = True
+
+        with self.assertRaises(refresh.RefreshError):
+            self._refresh()
+
+        self.assertEqual(before, self._snapshot_published_files())
+        self.assertEqual(1, len(self.fetch.login_inputs))
+        self.assertEqual(1, len(self.fetch.fetch_inputs))
+        self.assertEqual(1, len(self.fetch.audit_inputs))
+        self.assertEqual([], self.dashboard.calls)
+        self.assertTrue(self.fetch.session.closed)
+        self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
+
     def test_dashboard_failure_keeps_old_archive_and_dashboard(self):
         before = self._snapshot_published_files()
         self.dashboard.fail = True
@@ -306,12 +427,12 @@ class RefreshDashboardTests(unittest.TestCase):
         before = self._snapshot_published_files()
         original_replace = refresh._atomic_copy_replace
 
-        def fail_on_audit(source, target):
-            if target.name == "audit_report.json":
+        def fail_on_dashboard(source, target):
+            if target.name == refresh.DASHBOARD_NAME:
                 raise OSError("offline replacement failure")
             return original_replace(source, target)
 
-        with patch.object(refresh, "_atomic_copy_replace", side_effect=fail_on_audit):
+        with patch.object(refresh, "_atomic_copy_replace", side_effect=fail_on_dashboard):
             with self.assertRaises(refresh.RefreshPublishError):
                 self._refresh()
 

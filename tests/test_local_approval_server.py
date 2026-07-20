@@ -211,7 +211,11 @@ class LocalApprovalServerTests(unittest.TestCase):
                 raise RuntimeError("offline refresh runner timed out")
             if self.refresh_error is not None:
                 raise self.refresh_error
-            return SimpleNamespace(month="2026-07")
+            return SimpleNamespace(
+                month="2026-07",
+                refreshed_months=("2026-06", "2026-07"),
+                mapping_updated=True,
+            )
 
         self.server = create_server(
             port=0,
@@ -742,6 +746,9 @@ class LocalApprovalServerTests(unittest.TestCase):
         job = self._wait_refresh_job(job_id)
         self.assertEqual("succeeded", job["status"])
         self.assertEqual("2026-07", job["updated_month"])
+        self.assertEqual(["2026-06", "2026-07"], job["updated_months"])
+        self.assertTrue(job["mapping_updated"])
+        self.assertIn("允许机芯已核对", job["message"])
         self.assertEqual([self.root], self.refresh_calls)
         self.assertEqual([], self.clients)
         self.assertEqual([], self.native_confirmation_summaries)
@@ -814,6 +821,19 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertIn("数据刷新失败", job["message"])
         self.assertNotIn(internal_error, job["message"])
         self.assertEqual([], self.clients)
+
+    def test_dashboard_wiki_mapping_failure_has_safe_specific_message(self) -> None:
+        from refresh_dashboard import RefreshMappingError
+
+        internal_error = "secret-bearing-offline-wiki-detail"
+        self.refresh_error = RefreshMappingError(internal_error)
+        status, body = self._start_refresh()
+
+        self.assertEqual(202, status, body)
+        job = self._wait_refresh_job(body["job"]["job_id"])
+        self.assertEqual("failed", job["status"])
+        self.assertIn("Wiki 最新项目负荷附件检查失败", job["message"])
+        self.assertNotIn(internal_error, job["message"])
 
 
 if __name__ == "__main__":

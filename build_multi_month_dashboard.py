@@ -1032,7 +1032,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
             <h1>📋 SRDPM 工时审批看板</h1>
             <div class="meta" id="headerMeta">加载中...</div>
         </div>
-        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()" title="只从 SRDPM 读取当前自然月和前一个自然月；更早月份沿用本地归档">↻ 重新读取当前月+前一月</button>
+        <button class="btn-refresh-dashboard" id="btnRefreshDashboard" onclick="refreshDashboardData()" title="先同步 Wiki 最新允许机芯，再从 SRDPM 读取当前自然月和前一个自然月；更早月份沿用本地归档">↻ 同步 Wiki 并读取近两月</button>
     </div>
 </div>
 
@@ -2216,7 +2216,7 @@ async function pollDashboardRefreshJob(jobId) {
         if (job.status === "succeeded" || job.status === "failed") return job;
         setApprovalFeedback(
             "info",
-            job.message || "正在读取当前自然月和前一个自然月数据、重新审计并生成看板；不会提交审批…"
+            job.message || "正在检查 Wiki 最新允许机芯，并读取当前自然月和前一个自然月数据；不会提交审批…"
         );
     }
     const error = new Error("等待数据刷新结果超时；任务可能仍在进行，请勿重复点击并稍后重新打开看板");
@@ -2235,7 +2235,7 @@ async function refreshDashboardData() {
         // credential-backed refresh.  Open the protected same-origin page first.
         setApprovalFeedback(
             "info",
-            "正在打开本机看板；为保护登录凭据，请在打开后的页面点击“重新读取当前月+前一月”。"
+            "正在打开本机看板；为保护登录凭据，请在打开后的页面点击“同步 Wiki 并读取近两月”。"
         );
         location.assign(`${LOCAL_SERVICE_ORIGIN}/`);
         return;
@@ -2245,7 +2245,7 @@ async function refreshDashboardData() {
     setApprovalBusy(true);
     setApprovalFeedback(
         "info",
-        "正在重新读取 SRDPM 当前自然月和前一个自然月数据、重新审计并生成看板；此操作不会提交审批…"
+        "正在检查 Wiki 最新项目负荷附件，并重新读取 SRDPM 当前自然月和前一个自然月数据；此操作不会提交审批…"
     );
     try {
         const started = await requestLocalApprovalApi("/dashboard/refresh", {
@@ -2268,8 +2268,16 @@ async function refreshDashboardData() {
         // An archive refresh can change the meaning of a stable ID (for example,
         // after an operator corrected its source fields).  Never carry a prior
         // browser selection into the newly generated snapshot.
-        localStorage.removeItem(getStorageKey(job.updated_month));
-        setApprovalFeedback("success", "数据已刷新，已清除该月旧选择，正在重新加载最新看板…");
+        const refreshedMonths = Array.isArray(job.updated_months) && job.updated_months.length
+            ? job.updated_months
+            : [job.updated_month];
+        refreshedMonths.forEach(month => {
+            if (typeof month === "string") localStorage.removeItem(getStorageKey(month));
+        });
+        setApprovalFeedback(
+            "success",
+            `Wiki 允许机芯已核对，近两月数据已刷新并清除旧选择，正在重新加载最新看板…`
+        );
         reloadScheduled = true;
         setTimeout(() => location.reload(), 350);
     } catch (error) {

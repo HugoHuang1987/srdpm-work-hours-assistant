@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""安全刷新当前月 SRDPM 数据并重新生成本地看板。
+"""安全同步 Wiki 映射、刷新近两个月 SRDPM 数据并生成本地看板。
 
 这个入口故意不导入、也不调用任何审批执行层。它只做以下事情：
 
 1. 从当前 Windows 用户的 Credential Manager 读取已验证的凭据；
-2. 复用 ``fetch_and_audit.py`` 的只读抓取和本地审计；
-3. 复用 ``build_multi_month_dashboard.py`` 生成看板；
-4. 所有工作先在项目内临时目录完成，全部成功后才在刷新锁中发布。
+2. 从固定 Wiki 页面读取最新项目负荷附件并重建允许机芯映射；
+3. 复用 ``fetch_and_audit.py`` 的只读抓取和本地审计；
+4. 复用 ``build_multi_month_dashboard.py`` 生成看板；
+5. 所有工作先在项目内临时目录完成，全部成功后才在刷新锁中发布。
 
-命令行没有审批参数；默认且只能刷新当前本地日历月。
+命令行没有审批参数；默认且只能刷新当前及前一个本地日历月。
 """
 
 from __future__ import annotations
@@ -52,6 +53,10 @@ class RefreshBusyError(RefreshError):
 
 class RefreshCredentialError(RefreshError):
     """当前 Windows 用户没有可供刷新使用的凭据。"""
+
+
+class RefreshMappingError(RefreshError):
+    """Wiki 项目负荷附件未能安全转换为暂存映射。"""
 
 
 class RefreshPublishError(RefreshError):
@@ -153,6 +158,9 @@ def try_acquire_refresh_lock() -> RefreshLockHandle | None:
 class RefreshResult:
     month: str
     published_paths: tuple[Path, ...]
+    refreshed_months: tuple[str, ...] = ()
+    mapping_updated: bool = False
+    mapping_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +265,47 @@ def _validate_staged_month(stage_archive: Path, month: str) -> None:
         raise RefreshError("暂存审计结果结构异常，未发布旧归档")
 
 
+def _validate_staged_mapping(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RefreshMappingError("Wiki 项目映射未生成，旧数据未修改")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RefreshMappingError("Wiki 项目映射校验失败，旧数据未修改") from exc
+    mapping = payload.get("mapping") if isinstance(payload, dict) else None
+    person_projects = payload.get("person_projects") if isinstance(payload, dict) else None
+    all_people = payload.get("all_people") if isinstance(payload, dict) else None
+    if (
+        not isinstance(mapping, list)
+        or not mapping
+        or not isinstance(person_projects, dict)
+        or not person_projects
+        or not isinstance(all_people, list)
+        or not all_people
+    ):
+        raise RefreshMappingError("Wiki 项目映射结构异常，旧数据未修改")
+    if any(
+        not isinstance(person, str)
+        or not person.strip()
+        or not isinstance(entries, list)
+        or not entries
+        or any(not isinstance(entry, str) or not entry.strip() for entry in entries)
+        for person, entries in person_projects.items()
+    ):
+        raise RefreshMappingError("Wiki 人员允许机芯范围异常，旧数据未修改")
+
+
+def _clear_staged_month_artifacts(stage_archive: Path, month: str) -> None:
+    """Prevent a copied old report from validating as a newly generated one."""
+
+    month_dir = stage_archive / month
+    for name in REQUIRED_MONTH_ARTIFACTS:
+        path = month_dir / name
+        if path.exists() and not path.is_file():
+            raise RefreshError("暂存月份产物路径异常，未开始覆盖")
+        path.unlink(missing_ok=True)
+
+
 def _validate_staged_dashboard(path: Path) -> None:
     if not path.is_file() or path.stat().st_size <= 0:
         raise RefreshError("暂存看板未生成，未发布旧页面")
@@ -288,6 +337,8 @@ def _run_staged_fetch_and_audit(
     credentials: Any,
 ) -> None:
     _assert_fetch_read_only_contract(fetch_module)
+    month_label = f"{year:04d}-{month:02d}"
+    _clear_staged_month_artifacts(stage_archive, month_label)
     session: Any | None = None
     try:
         with _temporary_module_attributes(
@@ -303,7 +354,9 @@ def _run_staged_fetch_and_audit(
             result = fetch_module.fetch_month(session, year, month)
             if not result:
                 raise RefreshError("抓取未完成，未发布旧归档")
-            fetch_module.run_audit(year, month, result)
+            audit_result = fetch_module.run_audit(year, month, result)
+            if not audit_result:
+                raise RefreshError("审计未完成，未发布旧归档")
     finally:
         if session is not None:
             close = getattr(session, "close", None)
@@ -450,15 +503,20 @@ def refresh_current_month(
     credential_store: Any | None = None,
     fetch_module: Any | None = None,
     dashboard_module: Any | None = None,
+    mapping_refresher: Callable[[Path], Any] | None = None,
     lock_factory: Callable[[], RefreshLockHandle | None] = try_acquire_refresh_lock,
     execution_lock_factory: Callable[[], RefreshLockHandle | None] = _try_acquire_execution_lock,
 ) -> RefreshResult:
-    """Refresh the current calendar month, or leave every published file unchanged."""
+    """Refresh current/previous months, or leave every published file unchanged."""
 
     if fetch_module is None:
         import fetch_and_audit as fetch_module
     if dashboard_module is None:
         import build_multi_month_dashboard as dashboard_module
+    if mapping_refresher is None:
+        from wiki_project_mapping import refresh_project_mapping
+
+        mapping_refresher = refresh_project_mapping
 
     resolved_project = Path(project_dir).resolve()
     if not resolved_project.is_dir():
@@ -501,6 +559,17 @@ def refresh_current_month(
                     stage_root = Path(temporary_dir)
                     stage_archive = _copy_stage_snapshot(resolved_project, stage_root)
                     try:
+                        try:
+                            mapping_result = mapping_refresher(
+                                stage_root / MAPPING_NAME
+                            )
+                        except RefreshMappingError:
+                            raise
+                        except Exception as exc:
+                            raise RefreshMappingError(
+                                "Wiki 最新项目负荷附件检查失败，旧数据未修改"
+                            ) from exc
+                        _validate_staged_mapping(stage_root / MAPPING_NAME)
                         _run_staged_fetch_and_audit(
                             fetch_module=fetch_module,
                             stage_root=stage_root,
@@ -537,11 +606,21 @@ def refresh_current_month(
                             for name in REQUIRED_MONTH_ARTIFACTS
                         )
                     artifacts = tuple(month_artifacts) + (
+                        _Artifact(stage_root / MAPPING_NAME, resolved_project / MAPPING_NAME),
                         _Artifact(stage_root / CHIP_HISTORY_NAME, resolved_project / CHIP_HISTORY_NAME),
                         _Artifact(staged_dashboard, resolved_project / DASHBOARD_NAME),
                     )
                     _publish_staged_artifacts(artifacts, stage_root)
-                    return RefreshResult(month=month, published_paths=tuple(a.target for a in artifacts))
+                    source_name = getattr(mapping_result, "attachment_filename", None)
+                    if not isinstance(source_name, str) or not source_name.strip():
+                        source_name = None
+                    return RefreshResult(
+                        month=month,
+                        published_paths=tuple(a.target for a in artifacts),
+                        refreshed_months=tuple(label for _y, _m, label in refresh_months),
+                        mapping_updated=bool(getattr(mapping_result, "updated", False)),
+                        mapping_source=source_name,
+                    )
         finally:
             execution_lock.release()
     finally:
@@ -549,7 +628,9 @@ def refresh_current_month(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="刷新当前月 SRDPM 数据并生成本地看板")
+    parser = argparse.ArgumentParser(
+        description="同步 Wiki 映射、刷新当前月及前一月 SRDPM 数据并生成本地看板"
+    )
     parser.add_argument("--quiet", action="store_true", help="仅通过退出码返回结果")
     return parser
 
@@ -563,7 +644,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"刷新失败：{exc}")
         return 1
     if not args.quiet:
-        print(f"刷新完成：{result.month}；已更新本地归档和 {DASHBOARD_NAME}")
+        months = "、".join(result.refreshed_months or (result.month,))
+        print(f"刷新完成：{months}；已同步允许机芯、本地归档和 {DASHBOARD_NAME}")
     return 0
 
 

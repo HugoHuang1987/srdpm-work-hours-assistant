@@ -1,16 +1,17 @@
 {
+  "schema_version": 2,
+  "source": {
+    "kind": "confluence_attachment",
+    "page_id": "22824730",
+    "attachment_id": "132360786",
+    "filename": "团队成员项目负荷_新拆分-20260720.xlsx",
+    "updated_at": "2026-07-20T17:06:07.730+08:00",
+    "sha256": "810f7fa9d645c27828d9fa27a4cb6066875da5cb711400a446980ad795d83fdd",
+    "sheet": "计算负荷用-2026-7月"
+  },
   "mapping": [
     {
-      "row": 1,
-      "customer": "客户",
-      "project": "项目群",
-      "chip": "机芯",
-      "spm": "SPM",
-      "bsp": "BSP",
-      "diag": "DIAG"
-    },
-    {
-      "row": 2,
+      "row": 3,
       "customer": "G",
       "project": "N/P/C/B项目",
       "chip": "AM963",
@@ -19,8 +20,8 @@
       "diag": "邓赐祥"
     },
     {
-      "row": 4,
-      "customer": "",
+      "row": 5,
+      "customer": "G",
       "project": "N/P/C Rflesh",
       "chip": "AM966D5",
       "spm": "王明佳",
@@ -28,16 +29,16 @@
       "diag": "陈泽钦"
     },
     {
-      "row": 5,
-      "customer": "",
-      "project": "",
-      "chip": "",
-      "spm": "王明佳",
+      "row": 6,
+      "customer": "G",
+      "project": "N/P/C Rflesh",
+      "chip": "AM966D5",
+      "spm": "",
       "bsp": "",
       "diag": "邓赐祥"
     },
     {
-      "row": 6,
+      "row": 7,
       "customer": "P",
       "project": "Y26 JDM",
       "chip": "MT9025",
@@ -46,8 +47,8 @@
       "diag": ""
     },
     {
-      "row": 7,
-      "customer": "",
+      "row": 8,
+      "customer": "P",
       "project": "Avanta",
       "chip": "MT9289",
       "spm": "罗咏珊",
@@ -55,8 +56,8 @@
       "diag": ""
     },
     {
-      "row": 8,
-      "customer": "",
+      "row": 9,
+      "customer": "P",
       "project": "Avanta",
       "chip": "MT9676",
       "spm": "罗咏珊",
@@ -64,7 +65,7 @@
       "diag": ""
     },
     {
-      "row": 9,
+      "row": 10,
       "customer": "B",
       "project": "Helium",
       "chip": "AM950D5",
@@ -73,8 +74,8 @@
       "diag": ""
     },
     {
-      "row": 10,
-      "customer": "",
+      "row": 11,
+      "customer": "B",
       "project": "Hydrogen",
       "chip": "MT9026",
       "spm": "麦嘉桓",
@@ -82,17 +83,17 @@
       "diag": ""
     },
     {
-      "row": 11,
-      "customer": "",
+      "row": 12,
+      "customer": "B",
       "project": "",
-      "chip": "MT9026",
+      "chip": "MT9603",
       "spm": "",
       "bsp": "",
       "diag": ""
     },
     {
-      "row": 12,
-      "customer": "",
+      "row": 13,
+      "customer": "B",
       "project": "",
       "chip": "AM950D5",
       "spm": "",
@@ -100,7 +101,7 @@
       "diag": ""
     },
     {
-      "row": 13,
+      "row": 14,
       "customer": "M",
       "project": "FOS8",
       "chip": "MT9026",
@@ -109,17 +110,17 @@
       "diag": ""
     },
     {
-      "row": 14,
-      "customer": "",
+      "row": 15,
+      "customer": "M",
       "project": "P37M",
       "chip": "MT9026",
       "spm": "张文祺",
-      "bsp": "邓梓炜",
+      "bsp": "刘云培",
       "diag": ""
     },
     {
-      "row": 16,
-      "customer": "",
+      "row": 17,
+      "customer": "M",
       "project": "FOS14",
       "chip": "MT9603",
       "spm": "张文祺",
@@ -127,8 +128,8 @@
       "diag": ""
     },
     {
-      "row": 17,
-      "customer": "",
+      "row": 18,
+      "customer": "M",
       "project": "FOS14",
       "chip": "MT9603",
       "spm": "",
@@ -136,25 +137,25 @@
       "diag": ""
     },
     {
-      "row": 18,
-      "customer": "",
+      "row": 19,
+      "customer": "M",
       "project": "FOS14",
-      "chip": "AM950T？",
+      "chip": "AM950D5",
       "spm": "",
       "bsp": "",
       "diag": ""
     },
     {
-      "row": 19,
+      "row": 20,
       "customer": "T",
       "project": "FOS14",
-      "chip": "950D5",
+      "chip": "AM950D5",
       "spm": "罗咏珊",
       "bsp": "",
       "diag": ""
     },
     {
-      "row": 20,
+      "row": 21,
       "customer": "H",
       "project": "FOS8",
       "chip": "MT9025\nMT9026",
@@ -163,8 +164,8 @@
       "diag": ""
     },
     {
-      "row": 21,
-      "customer": "",
+      "row": 22,
+      "customer": "H",
       "project": "FOS8",
       "chip": "MT9025",
       "spm": "麦嘉桓",
@@ -172,8 +173,8 @@
       "diag": ""
     },
     {
-      "row": 22,
-      "customer": "",
+      "row": 23,
+      "customer": "H",
       "project": "FOS8",
       "chip": "MT9026",
       "spm": "麦嘉桓",
@@ -181,52 +182,16 @@
       "diag": ""
     },
     {
-      "row": 23,
-      "customer": "",
+      "row": 24,
+      "customer": "H",
       "project": "FOS8",
       "chip": "MT9025",
-      "spm": "",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 24,
-      "customer": "E 新客户",
-      "project": "FOS14",
-      "chip": "MT9603/L",
-      "spm": "",
-      "bsp": "",
-      "diag": ""
+      "spm": "麦嘉桓",
+      "bsp": "邓梓炜",
+      "diag": "钟远湛"
     },
     {
       "row": 25,
-      "customer": "Thomson",
-      "project": "",
-      "chip": "MT9026",
-      "spm": "",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 26,
-      "customer": "",
-      "project": "",
-      "chip": "AM950D5",
-      "spm": "",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 27,
-      "customer": "区域",
-      "project": "ODM+",
-      "chip": "MT9026L",
-      "spm": "罗咏珊",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 28,
       "customer": "预研",
       "project": "Anthem",
       "chip": "AM950D5",
@@ -235,17 +200,17 @@
       "diag": ""
     },
     {
-      "row": 29,
-      "customer": "",
+      "row": 26,
+      "customer": "预研",
       "project": "Anthem",
       "chip": "AM950D5",
       "spm": "梁郁沛",
-      "bsp": "闫晓光",
+      "bsp": "邓梓炜",
       "diag": ""
     },
     {
-      "row": 30,
-      "customer": "",
+      "row": 27,
+      "customer": "预研",
       "project": "MalmoFOS16",
       "chip": "MT9690",
       "spm": "李惠洁",
@@ -253,53 +218,62 @@
       "diag": ""
     },
     {
-      "row": 31,
-      "customer": "",
+      "row": 28,
+      "customer": "预研",
+      "project": "MalmoFOS16",
+      "chip": "MT9690",
+      "spm": "",
+      "bsp": "钟远湛",
+      "diag": ""
+    },
+    {
+      "row": 29,
+      "customer": "预研",
       "project": "FH 4K",
       "chip": "MT9603",
       "spm": "李惠洁",
+      "bsp": "闫晓光",
+      "diag": ""
+    },
+    {
+      "row": 30,
+      "customer": "预研",
+      "project": "FH 4K",
+      "chip": "MT9603",
+      "spm": "",
+      "bsp": "钟远湛",
+      "diag": ""
+    },
+    {
+      "row": 31,
+      "customer": "预研",
+      "project": "FH 2K",
+      "chip": "MT9603L",
+      "spm": "罗咏珊",
       "bsp": "钟远湛",
       "diag": ""
     },
     {
       "row": 32,
-      "customer": "",
-      "project": "",
-      "chip": "",
-      "spm": "",
-      "bsp": "闫晓光",
+      "customer": "预研",
+      "project": "Flensberg",
+      "chip": "AM963D5",
+      "spm": "李惠洁",
+      "bsp": "钟远湛",
       "diag": ""
     },
     {
       "row": 33,
-      "customer": "",
-      "project": "FH 2K",
-      "chip": "MT9603L",
-      "spm": "罗咏珊",
-      "bsp": "陈泽钦",
+      "customer": "预研",
+      "project": "",
+      "chip": "AM966D5",
+      "spm": "",
+      "bsp": "",
       "diag": ""
     },
     {
       "row": 34,
-      "customer": "",
-      "project": "Flensberg",
-      "chip": "AM963D5",
-      "spm": "李惠洁",
-      "bsp": "陈泽钦",
-      "diag": ""
-    },
-    {
-      "row": 35,
-      "customer": "",
-      "project": "",
-      "chip": "AM966D5",
-      "spm": "王明佳",
-      "bsp": "田昭辉",
-      "diag": "邓赐祥"
-    },
-    {
-      "row": 36,
-      "customer": "",
+      "customer": "预研",
       "project": "",
       "chip": "RTK",
       "spm": "",
@@ -307,7 +281,7 @@
       "diag": ""
     },
     {
-      "row": 38,
+      "row": 35,
       "customer": "公共",
       "project": "LD",
       "chip": "",
@@ -316,8 +290,8 @@
       "diag": ""
     },
     {
-      "row": 39,
-      "customer": "",
+      "row": 36,
+      "customer": "公共",
       "project": "质量",
       "chip": "",
       "spm": "王明佳",
@@ -325,191 +299,123 @@
       "diag": ""
     },
     {
-      "row": 40,
-      "customer": "",
+      "row": 37,
+      "customer": "公共",
       "project": "EDID",
       "chip": "",
       "spm": "",
-      "bsp": "",
+      "bsp": "邓赐祥",
       "diag": ""
     },
     {
-      "row": 41,
-      "customer": "",
+      "row": 38,
+      "customer": "公共",
       "project": "Diag APK",
       "chip": "",
       "spm": "",
       "bsp": "闫晓光",
       "diag": ""
-    },
-    {
-      "row": 47,
-      "customer": "",
-      "project": "",
-      "chip": "李惠洁",
-      "spm": "1.2000000000000002",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 48,
-      "customer": "",
-      "project": "",
-      "chip": "罗咏珊",
-      "spm": "0.6000000000000001",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 49,
-      "customer": "",
-      "project": "",
-      "chip": "王明佳",
-      "spm": "0.9",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 50,
-      "customer": "",
-      "project": "",
-      "chip": "麦嘉桓",
-      "spm": "0.7999999999999999",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 51,
-      "customer": "",
-      "project": "",
-      "chip": "张文祺",
-      "spm": "1",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 52,
-      "customer": "",
-      "project": "",
-      "chip": "",
-      "spm": "0.6000000000000001",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 53,
-      "customer": "",
-      "project": "",
-      "chip": "",
-      "spm": "0",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 55,
-      "customer": "",
-      "project": "",
-      "chip": "新增",
-      "spm": "",
-      "bsp": "",
-      "diag": ""
-    },
-    {
-      "row": 56,
-      "customer": "",
-      "project": "",
-      "chip": "待定缺口",
-      "spm": "",
-      "bsp": "",
-      "diag": ""
     }
   ],
   "person_projects": {
-    "王明佳": [
-      "G/AM963",
-      "AM966D5"
-    ],
-    "田昭辉": [
-      "G/AM963",
-      "AM966D5"
-    ],
-    "邓赐祥": [
-      "G/AM963",
-      "AM966D5"
-    ],
-    "陈泽钦": [
-      "AM966D5",
-      "MT9603L",
-      "AM963D5"
-    ],
-    "罗咏珊": [
-      "P/MT9025",
-      "MT9289",
-      "MT9676",
-      "T/950D5",
-      "区域/MT9026L",
-      "预研/AM950D5",
-      "MT9603L"
-    ],
-    "邓梓炜": [
-      "P/MT9025",
-      "MT9289",
-      "MT9676",
-      "M/MT9026",
-      "MT9026",
-      "H/MT9025",
-      "H/MT9026",
-      "MT9025"
-    ],
-    "麦嘉桓": [
-      "B/AM950D5",
-      "MT9026",
-      "MT9025"
-    ],
-    "闫晓光": [
-      "B/AM950D5",
-      "预研/AM950D5",
-      "AM950D5",
-      "MT9603",
-      "MT9690"
-    ],
     "刘云培": [
-      "MT9026",
-      "MT9603",
-      "公共/"
+      "B/MT9026",
+      "M/MT9026",
+      "M/MT9603",
+      "H/MT9026"
     ],
     "张文祺": [
       "M/MT9026",
-      "MT9026",
-      "MT9603"
+      "M/MT9603"
+    ],
+    "李惠洁": [
+      "预研/MT9690",
+      "预研/MT9603",
+      "预研/AM963D5"
     ],
     "梁郁沛": [
       "H/MT9025",
       "H/MT9026",
-      "AM950D5"
+      "预研/AM950D5"
     ],
-    "李惠洁": [
-      "MT9690",
-      "MT9603",
-      "AM963D5"
+    "王明佳": [
+      "G/AM963",
+      "G/AM966D5"
+    ],
+    "田昭辉": [
+      "G/AM963",
+      "G/AM966D5"
+    ],
+    "罗咏珊": [
+      "P/MT9025",
+      "P/MT9289",
+      "P/MT9676",
+      "T/AM950D5",
+      "预研/AM950D5",
+      "预研/MT9603L"
+    ],
+    "邓梓炜": [
+      "P/MT9025",
+      "P/MT9289",
+      "P/MT9676",
+      "M/MT9026",
+      "H/MT9025",
+      "H/MT9026",
+      "预研/AM950D5"
+    ],
+    "邓赐祥": [
+      "G/AM963",
+      "G/AM966D5"
     ],
     "钟远湛": [
-      "MT9603"
+      "H/MT9025",
+      "预研/MT9690",
+      "预研/MT9603",
+      "预研/MT9603L",
+      "预研/AM963D5"
+    ],
+    "闫晓光": [
+      "B/AM950D5",
+      "预研/AM950D5",
+      "预研/MT9690",
+      "预研/MT9603"
+    ],
+    "陈泽钦": [
+      "G/AM966D5"
+    ],
+    "麦嘉桓": [
+      "B/AM950D5",
+      "B/MT9026",
+      "H/MT9025",
+      "H/MT9026"
     ]
   },
   "all_people": [
-    "陈泽钦",
-    "罗咏珊",
-    "邓赐祥",
-    "梁郁沛",
-    "麦嘉桓",
-    "张文祺",
     "刘云培",
-    "田昭辉",
-    "闫晓光",
-    "王明佳",
-    "钟远湛",
+    "张文祺",
     "李惠洁",
-    "邓梓炜"
+    "梁郁沛",
+    "王明佳",
+    "田昭辉",
+    "罗咏珊",
+    "邓梓炜",
+    "邓赐祥",
+    "钟远湛",
+    "闫晓光",
+    "陈泽钦",
+    "麦嘉桓"
+  ],
+  "all_chips": [
+    "AM950D5",
+    "AM963",
+    "AM963D5",
+    "AM966D5",
+    "MT9025",
+    "MT9026",
+    "MT9289",
+    "MT9603",
+    "MT9603L",
+    "MT9676",
+    "MT9690"
   ]
 }
