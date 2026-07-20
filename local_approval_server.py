@@ -637,11 +637,20 @@ class ApprovalService:
 
         with self._state_lock:
             if self._refresh_active:
-                raise ServiceError(
-                    409,
-                    "refresh_busy",
-                    "已有数据刷新任务正在执行，请勿重复点击",
+                active_job = next(
+                    (
+                        job
+                        for job in reversed(tuple(self._refresh_jobs.values()))
+                        if job.get("status") in {"queued", "running"}
+                    ),
+                    None,
                 )
+                if active_job is not None:
+                    return copy.deepcopy(active_job)
+                # A terminal worker always clears this marker in ``finally``.
+                # Heal an inconsistent in-memory marker instead of permanently
+                # rejecting every later refresh until the service is restarted.
+                self._refresh_active = False
             if self._execution_lock.locked():
                 raise ServiceError(
                     409,
@@ -657,7 +666,7 @@ class ApprovalService:
                 "started_at": None,
                 "finished_at": None,
                 "updated_month": None,
-                "message": "等待读取当前自然月 SRDPM 数据",
+                "message": "等待读取当前自然月和前一个自然月 SRDPM 数据",
             }
             self._refresh_jobs[job_id] = job
             self._refresh_active = True
@@ -700,7 +709,7 @@ class ApprovalService:
                 job = self._refresh_jobs[job_id]
                 job["status"] = "running"
                 job["started_at"] = _utc_now_text()
-                job["message"] = "正在读取当前自然月数据、重新审计并生成看板；不会提交审批"
+                job["message"] = "正在读取当前自然月和前一个自然月数据、重新审计并生成看板；不会提交审批"
 
             result = self.refresh_runner(self.project_dir)
             updated_month = getattr(result, "month", None)

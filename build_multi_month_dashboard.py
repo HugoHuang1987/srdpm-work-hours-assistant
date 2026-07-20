@@ -2196,7 +2196,7 @@ async function pollDashboardRefreshJob(jobId) {
         if (job.status === "succeeded" || job.status === "failed") return job;
         setApprovalFeedback(
             "info",
-            job.message || "正在读取当前自然月数据、重新审计并生成看板；不会提交审批…"
+            job.message || "正在读取当前自然月和前一个自然月数据、重新审计并生成看板；不会提交审批…"
         );
     }
     const error = new Error("等待数据刷新结果超时；任务可能仍在进行，请勿重复点击并稍后重新打开看板");
@@ -2215,7 +2215,7 @@ async function refreshDashboardData() {
         // credential-backed refresh.  Open the protected same-origin page first.
         setApprovalFeedback(
             "info",
-            "正在打开本机看板；为保护登录凭据，请在打开后的页面点击“重新读取当前月数据”。"
+            "正在打开本机看板；为保护登录凭据，请在打开后的页面点击“重新读取当前月+前一月”。"
         );
         location.assign(`${LOCAL_SERVICE_ORIGIN}/`);
         return;
@@ -2225,7 +2225,7 @@ async function refreshDashboardData() {
     setApprovalBusy(true);
     setApprovalFeedback(
         "info",
-        "正在重新读取 SRDPM 当前自然月数据、重新审计并生成看板；此操作不会提交审批…"
+        "正在重新读取 SRDPM 当前自然月和前一个自然月数据、重新审计并生成看板；此操作不会提交审批…"
     );
     try {
         const started = await requestLocalApprovalApi("/dashboard/refresh", {

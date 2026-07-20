@@ -772,9 +772,10 @@ class LocalApprovalServerTests(unittest.TestCase):
             self.assertEqual(202, status, body)
             self.assertTrue(self.refresh_started.wait(timeout=1))
 
-            status, _, body = self._request("POST", "/api/v1/dashboard/refresh", {})
-            self.assertEqual(409, status, body)
-            self.assertEqual("refresh_busy", body["error"]["code"])
+            status, _, duplicate_body = self._request("POST", "/api/v1/dashboard/refresh", {})
+            self.assertEqual(202, status, duplicate_body)
+            self.assertEqual(body["job"]["job_id"], duplicate_body["job"]["job_id"])
+            self.assertEqual("running", duplicate_body["job"]["status"])
 
             status, _, body = self._request(
                 "POST",
