@@ -54,7 +54,7 @@ class ChipHistoryTests(unittest.TestCase):
         self.assertIsNone(audit.match_chip(d5, ["AM963D4"], norm))
         self.assertEqual("AM963D5", audit.match_chip(d5, ["AM963D5"], norm))
         self.assertEqual("AM963D5", audit.match_chip(short_d, ["AM963D5"], norm))
-        self.assertIsNone(audit.match_chip(d4, ["T963D4Z"], norm))
+        self.assertEqual("T963D4Z", audit.match_chip(d4, ["T963D4Z"], norm))
         self.assertEqual(
             "AM950D5",
             audit.match_chip(
@@ -63,6 +63,41 @@ class ChipHistoryTests(unittest.TestCase):
                 audit.build_chip_norm(["AM950D5"]),
             ),
         )
+
+    def test_t963_and_am963_are_aliases_but_explicit_revisions_stay_separate(self):
+        title = (
+            "预研 43D7100U 1AM96DA6ATAT FTV INX V430DJ1-Q01 "
+            "D2(NOVA/FITI) TV 预研项目 （T963D5机芯）"
+        )
+        candidates = audit.extract_chip_candidates(title)
+        selected = audit.select_chip_candidates_for_matching(candidates)
+        norm = audit.build_chip_norm(["AM963D4", "AM963D5", "T963D4Z"])
+
+        self.assertEqual(["T963D5"], [candidate[0] for candidate in selected])
+        self.assertEqual("AM963D5", audit.match_chip(selected[0], ["AM963D5"], norm))
+        self.assertIsNone(audit.match_chip(selected[0], ["AM963D4"], norm))
+        self.assertIsNone(audit.match_chip(selected[0], ["T963D4Z"], norm))
+
+        ok, _reason, matched, _allowed, _codes = audit.check_project_ownership(
+            "离线测试人员",
+            "G",
+            title,
+            candidates,
+            {"离线测试人员": ["AM963D5"]},
+            norm,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(["AM963D5"], matched)
+
+        wrong_revision_ok, *_rest = audit.check_project_ownership(
+            "离线测试人员",
+            "G",
+            title,
+            candidates,
+            {"离线测试人员": ["T963D4Z"]},
+            norm,
+        )
+        self.assertFalse(wrong_revision_ok)
 
     def test_missing_history_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

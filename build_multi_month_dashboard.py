@@ -21,6 +21,12 @@ from approval_model import (
     normalize_approve_ids,
     summarize_groups,
 )
+from fetch_and_audit import (
+    build_chip_norm,
+    extract_chip_candidates,
+    match_chip,
+    select_chip_candidates_for_matching,
+)
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -31,6 +37,36 @@ PROJECT_DIR = Path(__file__).resolve().parent
 OUT_DIR = str(PROJECT_DIR)
 ARCHIVE_DIR = os.path.join(OUT_DIR, "srdpm_archive")
 OUTPUT_HTML = os.path.join(OUT_DIR, "工时审批看板_多月.html")
+
+
+def load_known_chip_codes():
+    """读取当前构建目录中的只增不减机芯历史库。"""
+    history_path = Path(OUT_DIR) / "chip_history.json"
+    try:
+        payload = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    chips = payload.get("chips", [])
+    if not isinstance(chips, list):
+        return []
+    return sorted({str(chip).strip().upper() for chip in chips if str(chip).strip()})
+
+
+def identify_project_chip(project_name, known_chips=None):
+    """按统一审计规则识别展示机芯，并保留明确 D4/D5 版本。"""
+    candidates = select_chip_candidates_for_matching(
+        extract_chip_candidates(project_name)
+    )
+    if not candidates:
+        return ""
+    codes = known_chips if known_chips is not None else load_known_chip_codes()
+    norms = build_chip_norm(codes)
+    for candidate in candidates:
+        matched = match_chip(candidate, codes, norms)
+        if matched:
+            return matched
+    # 即使 Wiki/历史库暂未收录，明确写出的机芯版本也不应显示为未识别。
+    return candidates[0][0] if candidates else ""
 
 
 def serialize_for_inline_script(value):
@@ -92,6 +128,7 @@ def build_category_data(data, md_text, raw_data=None):
     """从审核JSON + MD构建看板分类数据，并尝试把 raw_data 中的真实审批状态带进来"""
 
     raw_children = iter_unique_children(raw_data)
+    known_chips = load_known_chip_codes()
 
     def determine_status(date, person, items=None, title=None):
         """根据 raw_data 判断该异常条目在 SRDPM 系统上的真实状态"""
@@ -473,12 +510,7 @@ def build_category_data(data, md_text, raw_data=None):
             title = child.get("title", "")
             content = child.get("content", "")
             project_name = child.get("project_name", "") or ""
-            chip = ""
-            chip_match = re.search(r'\d((?:MT|AM)\d{3,4}[A-Z0-9]*)', str(project_name))
-            if chip_match:
-                chip_code = chip_match.group(1)
-                chip_prefix = re.match(r'(?:MT|AM)\d{3,4}', chip_code)
-                chip = chip_prefix.group(0) if chip_prefix else chip_code
+            chip = identify_project_chip(project_name, known_chips)
             if any(kw in (title + content) for kw in ["出差", "休假", "请假", "leave", "Leave"]):
                 continue
             # 正常条目按这一条 SRDPM 明细选择，避免扩大为人员日期整单。
@@ -532,13 +564,7 @@ def build_category_data(data, md_text, raw_data=None):
             bucket = "公共事务/平台"
         else:
             project_name = child.get("project_name", "") or ""
-            chip_match = re.search(r'\d((?:MT|AM)\d{3,4}[A-Z0-9]*)', str(project_name))
-            if chip_match:
-                chip_code = chip_match.group(1)
-                chip_prefix = re.match(r'(?:MT|AM)\d{3,4}', chip_code)
-                bucket = chip_prefix.group(0) if chip_prefix else chip_code
-            else:
-                bucket = "未识别机芯"
+            bucket = identify_project_chip(project_name, known_chips) or "未识别机芯"
         summary_items.append({
             "date": record["date"],
             "person": record["person"],
@@ -567,6 +593,7 @@ def build_enhanced_stats(raw_data):
         return None
 
     records = []
+    known_chips = load_known_chip_codes()
     for record in iter_unique_children(raw_data):
         date_str = record["date"]
         person = record["person"]
@@ -579,14 +606,7 @@ def build_enhanced_stats(raw_data):
         hours = float(child.get("work_hours", 0))
         customer = child.get("customer") or ""
 
-        chip = ""
-        if project_name and project_name != "-":
-            m = re.search(r'\d(MT\d{3,4}[A-Z0-9]*|AM\d{3,4}[A-Z0-9]*)', str(project_name))
-            if m:
-                chip_raw = m.group(1)
-                cm = re.match(r'(MT|AM)(\d{3,4})', chip_raw)
-                if cm:
-                    chip = cm.group(0)
+        chip = identify_project_chip(project_name, known_chips)
 
         is_platform = (rec_type == "纯平台类") or items.startswith("YF-CP") or items.startswith("YF-SW")
 
@@ -946,7 +966,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .filter-row input, .filter-row select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
 .filter-row label { font-size: 13px; color: #666; font-weight: 500; }
 .filter-count { font-size: 13px; color: #888; margin-left: auto; }
-.six-tools-row { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(520px, 1.5fr); gap: 18px; align-items: start; margin-bottom: 12px; }
+.six-tools-row { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(780px, 2.25fr); gap: 18px; align-items: start; margin-bottom: 12px; }
 .six-filter-box { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .multi-filter { position: relative; }
 .multi-filter summary { list-style: none; min-width: 110px; padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; cursor: pointer; font-size: 13px; }
@@ -954,7 +974,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .multi-filter-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 180px; max-height: 260px; overflow: auto; padding: 8px; background: #fff; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 8px 22px rgba(0,0,0,.15); }
 .multi-filter-menu label { display: block; padding: 5px 6px; white-space: nowrap; cursor: pointer; }
 .multi-filter-menu input { margin-right: 7px; }
-.hours-summary { width: 100%; min-height: 320px; border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 520px; }
+.hours-summary { width: 100%; min-height: 480px; border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 780px; }
 .hours-summary h4 { position: sticky; left: 0; margin: 0; padding: 11px 14px; background: #f5f7fb; color: #334; font-size: 15px; }
 .hours-summary table { width: 100%; min-width: 0; font-size: 13px; }
 .hours-summary th, .hours-summary td { padding: 8px 11px; text-align: right; }

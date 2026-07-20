@@ -239,6 +239,44 @@ class CurrentArchiveRegressionTests(unittest.TestCase):
         self.assertIn("公共事务/平台", buckets)
         self.assertIn("请假/出差/休假", buckets)
 
+    def test_t963d5_project_is_identified_in_normal_and_summary_views(self):
+        audit_data = {
+            "platform_summary": {},
+            "missed": {},
+            "no_checkin_leave": [],
+            "hours_over": [],
+            "hours_low": [],
+            "project_mismatch": [],
+        }
+        project_name = (
+            "预研 43D7100U 1AM96DA6ATAT FTV INX V430DJ1-Q01 "
+            "D2(NOVA/FITI) TV 预研项目 （T963D5机芯）"
+        )
+        raw = {
+            "daily_data": {
+                "2026-07-01": {
+                    "list": [{
+                        "cn_name": "离线测试人员",
+                        "children": [{
+                            "approve_id": "offline-t963d5-1",
+                            "items": "TVY25-N-004",
+                            "project_name": project_name,
+                            "title": "项目事务",
+                            "content": "离线测试",
+                            "work_hours": 2,
+                            "status": "待审",
+                        }],
+                    }]
+                }
+            }
+        }
+
+        cats = dashboard.build_category_data(audit_data, "", raw)
+        self.assertEqual("AM963D5", cats["six"]["items"][0]["chip"])
+        self.assertEqual("AM963D5", cats["zero"]["items"][0]["chip"])
+        group_names = [name for name, _stats in dashboard.build_enhanced_stats(raw)["group_ranking"]]
+        self.assertIn("未分类/AM963D5", group_names)
+
 
 if __name__ == "__main__":
     unittest.main()

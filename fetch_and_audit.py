@@ -508,6 +508,16 @@ def _explicit_d_revision(suffix):
     return match.group(1) if match else None
 
 
+def select_chip_candidates_for_matching(chip_candidates):
+    """明确写出的 D4/D5 优先，避免前面的模糊整机码掩盖真实机芯版本。"""
+    explicit = [
+        candidate
+        for candidate in chip_candidates
+        if _explicit_d_revision(candidate[3])
+    ]
+    return explicit or list(chip_candidates)
+
+
 def extract_chip_candidates(project_name):
     if not project_name or project_name == '-':
         return []
@@ -539,10 +549,16 @@ def match_chip(candidate_tuple, allowed_chips, wiki_chips_norm):
         if chip_pure not in wiki_chips_norm:
             continue
         wiki_pref, wiki_num, wiki_suf = wiki_chips_norm[chip_pure]
-        if cand_pref == wiki_pref:
+        same_963_family = (
+            {cand_pref, wiki_pref} == {'AM', 'T'} and
+            cand_num == wiki_num == '963'
+        )
+        if cand_pref == wiki_pref or same_963_family:
             cand_revision = _explicit_d_revision(cand_suf)
             wiki_revision = _explicit_d_revision(wiki_suf)
-            if cand_revision and wiki_revision and cand_revision != wiki_revision:
+            # An explicit project revision must match exactly.  A project code
+            # without D4/D5 may retain the existing broad matching behavior.
+            if cand_revision and cand_revision != wiki_revision:
                 continue
             if (cand_num == wiki_num or wiki_num.startswith(cand_num) or
                     wiki_num.endswith(cand_num)):
@@ -579,8 +595,9 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
     allowed = person_projects[person]
     allowed_chips = [c.split('/')[-1].strip() for c in allowed]
 
+    matching_candidates = select_chip_candidates_for_matching(chip_candidates)
     matched = []
-    for cand in chip_candidates:
+    for cand in matching_candidates:
         m = match_chip(cand, allowed, wiki_chips_norm)
         if m:
             matched.append(m)
@@ -595,7 +612,7 @@ def check_project_ownership(person, customer, project_name, chip_candidates, per
 
     historical_matches = []
     if chip_history and chip_history_norm:
-        for cand in chip_candidates:
+        for cand in matching_candidates:
             historical = match_chip(cand, chip_history, chip_history_norm)
             if historical and historical not in historical_matches:
                 historical_matches.append(historical)
