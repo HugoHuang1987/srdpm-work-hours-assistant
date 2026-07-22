@@ -959,15 +959,33 @@ class DashboardUiTests(unittest.TestCase):
             self.assertIn(chip, summary_text)
         self.assert_no_page_errors()
 
-    def test_hours_summary_uses_expanded_width_and_height(self):
-        self.page.locator('.cat-nav-item[data-cat="zero"]').click()
-        summary_box = self.page.locator("#panel_zero .hours-summary").bounding_box()
-        filter_box = self.page.locator("#panel_zero .six-filter-box").bounding_box()
+    def test_zero_and_six_hours_summaries_are_one_and_half_times_larger(self):
+        for key in ("zero", "six"):
+            self.page.locator(f'.cat-nav-item[data-cat="{key}"]').click()
+            summary = self.page.locator(f"#panel_{key} .hours-summary")
+            summary_box = summary.bounding_box()
+            layout = summary.evaluate(
+                """element => {
+                    const style = getComputedStyle(element);
+                    const contentStyle = getComputedStyle(document.querySelector('#contentArea'));
+                    return {
+                        minWidth: style.minWidth,
+                        minHeight: style.minHeight,
+                        maxHeight: style.maxHeight,
+                        contentMaxWidth: contentStyle.maxWidth,
+                        expanded: document.querySelector('#contentArea').classList.contains('summary-expanded')
+                    };
+                }"""
+            )
 
-        self.assertIsNotNone(summary_box)
-        self.assertIsNotNone(filter_box)
-        self.assertGreaterEqual(summary_box["height"], 480)
-        self.assertGreater(summary_box["width"], filter_box["width"] * 1.5)
+            self.assertIsNotNone(summary_box)
+            self.assertGreaterEqual(summary_box["width"], 1170, key)
+            self.assertGreaterEqual(summary_box["height"], 720, key)
+            self.assertEqual("1170px", layout["minWidth"], key)
+            self.assertEqual("720px", layout["minHeight"], key)
+            self.assertEqual("1170px", layout["maxHeight"], key)
+            self.assertEqual("2100px", layout["contentMaxWidth"], key)
+            self.assertTrue(layout["expanded"], key)
         self.assert_no_page_errors()
 
     def test_month_selector_supports_multiple_months_and_select_all(self):

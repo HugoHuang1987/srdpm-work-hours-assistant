@@ -996,6 +996,7 @@ body.approval-busy .btn-refresh-dashboard { pointer-events: none; opacity: .55; 
 .cat-nav-item.complete.active { background: #c8e6c9; border-color: #1a7a1a; }
 
 .content { padding: 20px 32px; max-width: 1400px; }
+.content.summary-expanded { max-width: 2100px; }
 .panel { display: none; }
 .panel.active { display: block; }
 .panel-desc { font-size: 14px; color: #666; margin-bottom: 14px; padding: 10px 16px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #1a73e8; }
@@ -1027,7 +1028,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .filter-row input, .filter-row select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
 .filter-row label { font-size: 13px; color: #666; font-weight: 500; }
 .filter-count { font-size: 13px; color: #888; margin-left: auto; }
-.six-tools-row { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(780px, 2.25fr); gap: 18px; align-items: start; margin-bottom: 12px; }
+.six-tools-row { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(1170px, 2.25fr); gap: 18px; align-items: start; margin-bottom: 12px; }
 .six-filter-box { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .multi-filter { position: relative; }
 .multi-filter summary { list-style: none; min-width: 110px; padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff; cursor: pointer; font-size: 13px; }
@@ -1035,7 +1036,7 @@ td.content-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
 .multi-filter-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 180px; max-height: 260px; overflow: auto; padding: 8px; background: #fff; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 8px 22px rgba(0,0,0,.15); }
 .multi-filter-menu label { display: block; padding: 5px 6px; white-space: nowrap; cursor: pointer; }
 .multi-filter-menu input { margin-right: 7px; }
-.hours-summary { width: 100%; min-height: 480px; border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 780px; }
+.hours-summary { width: 100%; min-width: 1170px; min-height: 720px; border: 1px solid #dfe3eb; border-radius: 8px; background: #fff; overflow: auto; max-height: 1170px; }
 .hours-summary h4 { position: sticky; left: 0; margin: 0; padding: 11px 14px; background: #f5f7fb; color: #334; font-size: 15px; }
 .hours-summary table { width: 100%; min-width: 0; font-size: 13px; }
 .hours-summary th, .hours-summary td { padding: 8px 11px; text-align: right; }
@@ -1620,6 +1621,7 @@ function renderPanel(key) {
     const area = document.getElementById("contentArea");
     const instructions = document.getElementById("instructionsPanel");
     instructions.style.display = "none";
+    area.classList.toggle("summary-expanded", key === "zero" || key === "six");
 
     let html = `<div class="panel active" id="panel_${key}">`;
     html += `<div class="panel-desc">${escapeHtml(cat.desc || cat.subtitle || "")}</div>`;
