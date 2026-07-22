@@ -27,6 +27,8 @@ srdpm_approve_captured_*.json
 
 # Sensitive raw data, archives, reports, and logs
 srdpm_archive/
+**/approval_readback.json
+**/.approval_readback.*.tmp
 **/raw_data.json
 **/audit_report.json
 **/audit_report.md

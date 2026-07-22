@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -188,6 +189,7 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.release_refresh = threading.Event()
         self.release_refresh.set()
         self.refresh_error: Exception | None = None
+        self.dashboard_rebuild_calls: list[Path] = []
 
         def factory() -> FakeClient:
             client = self.client_builder()
@@ -217,6 +219,10 @@ class LocalApprovalServerTests(unittest.TestCase):
                 mapping_updated=True,
             )
 
+        def dashboard_rebuilder(project_dir: Path) -> Path:
+            self.dashboard_rebuild_calls.append(Path(project_dir))
+            return Path(project_dir) / DASHBOARD_NAME
+
         self.server = create_server(
             port=0,
             project_dir=self.root,
@@ -226,6 +232,7 @@ class LocalApprovalServerTests(unittest.TestCase):
             credential_client_factory=credential_factory,
             approval_confirmer=approval_confirmer,
             refresh_runner=refresh_runner,
+            dashboard_rebuilder=dashboard_rebuilder,
             monotonic=self.clock,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -606,6 +613,15 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertEqual(2, native_summary.group_count)
         self.assertEqual(prepared["summary"]["sha256"], native_summary.sha256)
 
+        ledger = json.loads(
+            (self.month_dir / "approval_readback.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual({"1001", "2001"}, set(ledger["entries"]))
+        self.assertEqual("succeeded", job["local_persistence"])
+        with self.assertRaises(ServiceError) as context:
+            rebuild_plan_from_archive(self.archive, "2026-07", [self.group_a])
+        self.assertEqual("group_already_approved", context.exception.code)
+
     def test_background_job_uses_stored_windows_credentials(self) -> None:
         self.credential_store.credentials = Credentials(
             "stored-offline-user", "stored-offline-password"
@@ -625,6 +641,86 @@ class LocalApprovalServerTests(unittest.TestCase):
         )
         self.assertEqual(1, len(self.credential_clients[0].approve_calls))
         self.assertTrue(self.credential_clients[0].closed)
+
+    def test_real_service_wiring_rebuilds_html_with_persisted_approved_status(self) -> None:
+        (self.root / "project_mapping.json").write_text("{}", encoding="utf-8")
+        (self.root / "chip_history.json").write_text(
+            '{"schema_version":1,"chips":[]}', encoding="utf-8"
+        )
+        self.server.service.dashboard_rebuilder = (
+            self.server.service._rebuild_local_dashboard
+        )
+        prepared = self._prepare([self.group_a])
+        status, body = self._execute(prepared["ticket"])
+        self.assertEqual(202, status)
+        job = self._wait_job(body["job"]["job_id"])
+
+        self.assertEqual("succeeded", job["local_persistence"])
+        status, _headers, html = self._request("GET", "/", secure=False)
+        self.assertEqual(200, status)
+        match = re.search(
+            r"const ALL_DATA = (.*?);\s*const MONTH_SELECTION_KEY",
+            html,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        embedded = json.loads(match.group(1))
+        self.assertEqual(
+            "approved",
+            embedded["2026-07"]["approval_groups"][self.group_a]["status"],
+        )
+
+    def test_verified_remote_result_is_not_downgraded_when_local_store_fails(self) -> None:
+        def fail_write(_month_dir, _month, _entries):
+            raise OSError("offline local persistence failure")
+
+        self.server.service.readback_writer = fail_write
+        prepared = self._prepare([self.group_a])
+        status, body = self._execute(prepared["ticket"])
+        self.assertEqual(202, status)
+        job = self._wait_job(body["job"]["job_id"])
+
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual("verified_approved", job["groups"][0]["state"])
+        self.assertEqual("failed", job["local_persistence"])
+        self.assertIn("本地审批状态保存失败", job["message"])
+        self.assertFalse((self.month_dir / "approval_readback.json").exists())
+        self.assertEqual([], self.dashboard_rebuild_calls)
+
+    def test_ledger_remains_authoritative_when_derived_dashboard_rebuild_fails(self) -> None:
+        def fail_rebuild(_project_dir):
+            raise RuntimeError("offline dashboard build failure")
+
+        self.server.service.dashboard_rebuilder = fail_rebuild
+        prepared = self._prepare([self.group_a])
+        status, body = self._execute(prepared["ticket"])
+        self.assertEqual(202, status)
+        job = self._wait_job(body["job"]["job_id"])
+
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual("verified_approved", job["groups"][0]["state"])
+        self.assertEqual("ledger_saved", job["local_persistence"])
+        self.assertIn("看板重建未完成", job["message"])
+        ledger = json.loads(
+            (self.month_dir / "approval_readback.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual({"1001"}, set(ledger["entries"]))
+
+        os.utime(self.root / DASHBOARD_NAME, (1, 1))
+        heal_calls = []
+
+        def heal_dashboard(project_dir):
+            heal_calls.append(Path(project_dir))
+            (Path(project_dir) / DASHBOARD_NAME).write_text(
+                "<!doctype html><html><head><title>healed</title></head><body>healed</body></html>",
+                encoding="utf-8",
+            )
+
+        self.server.service.dashboard_rebuilder = heal_dashboard
+        status, _headers, html = self._request("GET", "/", secure=False)
+        self.assertEqual(200, status)
+        self.assertIn("healed", html)
+        self.assertEqual([self.root], heal_calls)
 
     def test_second_group_preflight_drift_maps_to_its_stable_group_key(self) -> None:
         self.client_builder = lambda: FakeClient(
@@ -687,6 +783,12 @@ class LocalApprovalServerTests(unittest.TestCase):
         self.assertEqual("not_attempted", by_key[self.group_c]["state"])
         self.assertEqual(2, len(self.clients[0].approve_calls))
         self.assertTrue(self.clients[0].closed)
+
+        ledger = json.loads(
+            (self.month_dir / "approval_readback.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual({"1001"}, set(ledger["entries"]))
+        self.assertEqual("succeeded", job["local_persistence"])
 
     def test_archive_change_after_prepare_fails_before_client_creation(self) -> None:
         prepared = self._prepare([self.group_a])

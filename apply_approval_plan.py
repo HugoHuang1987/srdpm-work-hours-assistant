@@ -695,13 +695,22 @@ def _execute_plan_with_lock_held(
 
 
 def execute_plan(
-    plan: ApprovalPlan, client: ApprovalClient, *, allow_partial: bool = False
+    plan: ApprovalPlan,
+    client: ApprovalClient,
+    *,
+    allow_partial: bool = False,
+    after_report: Callable[[ApprovalPlan, ExecutionReport], None] | None = None,
 ) -> ExecutionReport:
     """在共享执行锁保护下执行计划；锁忙时不访问客户端。
 
     ``allow_partial`` is reserved for the local service after it has rebuilt an
     exact category-row whitelist.  Standalone plans keep the original strict
     person-day equality requirement.
+
+    ``after_report`` runs exactly once after an execution report has been
+    produced while the shared execution lock is still held.  It is not called
+    when the lock cannot be acquired because there is no protected execution
+    report in that case.  Callback errors propagate after the lock is released.
     """
 
     try:
@@ -726,9 +735,12 @@ def execute_plan(
         )
 
     try:
-        return _execute_plan_with_lock_held(
+        report = _execute_plan_with_lock_held(
             plan, client, allow_partial=allow_partial
         )
+        if after_report is not None:
+            after_report(plan, report)
+        return report
     finally:
         execution_lock.release()
 

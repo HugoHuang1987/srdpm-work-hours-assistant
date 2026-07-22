@@ -174,10 +174,15 @@ class FakeDashboardModule:
         self.ARCHIVE_DIR = "original-archive"
         self.OUTPUT_HTML = "original-output"
         self.calls = []
+        self.readback_snapshots = {}
         self.fail = False
 
     def main(self):
         self.calls.append((self.OUT_DIR, self.ARCHIVE_DIR, self.OUTPUT_HTML))
+        self.readback_snapshots = {
+            path.parent.name: path.read_bytes()
+            for path in Path(self.ARCHIVE_DIR).glob("*/approval_readback.json")
+        }
         if self.fail:
             raise RuntimeError("offline dashboard failure")
         Path(self.OUTPUT_HTML).write_text(
@@ -390,6 +395,18 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertFalse((self.project / "srdpm_daily_data_20260701_20260731.json").exists())
         self.assertFalse((self.project / "审核报告_2026年7月.json").exists())
 
+    def test_full_refresh_preserves_monthly_approval_readback_ledger(self):
+        ledger_path = self.month_dir / "approval_readback.json"
+        ledger_bytes = (
+            b'{"schema_version":1,"month":"2026-07","entries":{}}\n'
+        )
+        ledger_path.write_bytes(ledger_bytes)
+
+        self._refresh()
+
+        self.assertEqual(ledger_bytes, ledger_path.read_bytes())
+        self.assertEqual(ledger_bytes, self.dashboard.readback_snapshots[self.month])
+
     def test_missing_credentials_does_not_fetch_or_modify_published_files(self):
         before = self._snapshot_published_files()
         missing_store = FakeCredentialStore(None)
@@ -509,6 +526,48 @@ class RefreshDashboardTests(unittest.TestCase):
         self.assertEqual([], self.fetch.login_inputs)
         self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
         self.assertTrue(self.lock.released)
+
+    def test_local_archive_rebuild_publishes_only_dashboard_under_both_locks(self):
+        before = self._snapshot_published_files()
+
+        output = refresh.rebuild_dashboard_from_local_archive(
+            project_dir=self.project,
+            dashboard_module=self.dashboard,
+            lock_factory=lambda: self.lock,
+            execution_lock_factory=lambda: self.execution_lock,
+        )
+
+        self.assertEqual(self.project / refresh.DASHBOARD_NAME, output)
+        after = self._snapshot_published_files()
+        self.assertNotEqual(before[self.project / refresh.DASHBOARD_NAME], after[output])
+        for path, content in before.items():
+            if path != self.project / refresh.DASHBOARD_NAME:
+                self.assertEqual(content, after[path])
+        self.assertIn("staged new dashboard", output.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(self.dashboard.calls))
+        self.assertEqual(0, self.store.load_calls)
+        self.assertEqual([], self.fetch.login_inputs)
+        self.assertEqual([], self.mapping_refresher.calls)
+        self.assertTrue(self.lock.released)
+        self.assertTrue(self.execution_lock.released)
+        self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
+
+    def test_local_archive_rebuild_failure_keeps_old_dashboard(self):
+        before = self._snapshot_published_files()
+        self.dashboard.fail = True
+
+        with self.assertRaises(refresh.RefreshError):
+            refresh.rebuild_dashboard_from_local_archive(
+                project_dir=self.project,
+                dashboard_module=self.dashboard,
+                lock_factory=lambda: self.lock,
+                execution_lock_factory=lambda: self.execution_lock,
+            )
+
+        self.assertEqual(before, self._snapshot_published_files())
+        self.assertTrue(self.lock.released)
+        self.assertTrue(self.execution_lock.released)
+        self.assertFalse((self.project / refresh.REFRESH_FILE_LOCK_NAME).exists())
 
     def test_current_month_uses_local_calendar_month(self):
         self.assertEqual((2027, 1, "2027-01"), refresh.current_month(datetime(2027, 1, 1, 0, 0)))

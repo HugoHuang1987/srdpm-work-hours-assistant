@@ -39,11 +39,20 @@ from urllib.parse import urlsplit
 
 from apply_approval_plan import (
     ApprovalPlan,
+    ExecutionReport,
     PlanSummary,
     PlanValidationError,
     execute_plan,
     parse_plan,
     summarize_plan,
+)
+from approval_readback_store import (
+    ApprovalReadbackError,
+    READBACK_FILENAME,
+    READBACK_SOURCE,
+    load_approval_readback,
+    overlay_approval_readback,
+    save_approval_readback_entries,
 )
 from approval_model import (
     assign_primary_categories,
@@ -233,6 +242,15 @@ def rebuild_plan_from_archive(
     raw_data = _read_json_file(month_dir / "raw_data.json", "原始审批数据", required=True)
     if not isinstance(audit_data, Mapping) or not isinstance(raw_data, Mapping):
         raise ServiceError(409, "archive_invalid", "当前月份归档根节点结构异常")
+    try:
+        readback = load_approval_readback(month_dir, month)
+        raw_data = overlay_approval_readback(raw_data, readback)
+    except ApprovalReadbackError as exc:
+        raise ServiceError(
+            409,
+            "archive_invalid",
+            "当前月份审批回读存档无效，已停止重建审批白名单",
+        ) from exc
     md_path = month_dir / "audit_report.md"
     try:
         md_text = md_path.read_text(encoding="utf-8") if md_path.is_file() else ""
@@ -392,6 +410,9 @@ class ApprovalService:
         credential_client_factory: Callable[[str, str], Any] = SRDPMClient.from_credentials,
         approval_confirmer: Callable[[PlanSummary], bool] = confirm_approval_with_windows,
         refresh_runner: Callable[[Path], Any] | None = None,
+        dashboard_rebuilder: Callable[[Path], Any] | None = None,
+        readback_writer: Callable[[Path, str, Sequence[Mapping[str, Any]]], Any]
+        | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
@@ -406,6 +427,8 @@ class ApprovalService:
         self.approval_confirmer = approval_confirmer
         self.client_factory = client_factory or self._client_from_configured_credentials
         self.refresh_runner = refresh_runner or self._refresh_current_month
+        self.dashboard_rebuilder = dashboard_rebuilder or self._rebuild_local_dashboard
+        self.readback_writer = readback_writer or save_approval_readback_entries
         self.monotonic = monotonic
         self.instance_id = secrets.token_urlsafe(18)
         self.csrf_token = secrets.token_urlsafe(32)
@@ -492,6 +515,13 @@ class ApprovalService:
         from refresh_dashboard import refresh_current_month
 
         return refresh_current_month(project_dir=project_dir)
+
+    def _rebuild_local_dashboard(self, project_dir: Path) -> Any:
+        """Regenerate the static page from local files only, without network I/O."""
+
+        from refresh_dashboard import rebuild_dashboard_from_local_archive
+
+        return rebuild_dashboard_from_local_archive(project_dir=project_dir)
 
     def _raise_if_refresh_active_locked(self) -> None:
         if self._refresh_active:
@@ -605,6 +635,8 @@ class ApprovalService:
                 "finished_at": None,
                 "message": "等待执行",
                 "groups": [],
+                "local_persistence": "pending",
+                "verified_id_count": 0,
             }
             self._jobs[job_id] = job
 
@@ -775,8 +807,48 @@ class ApprovalService:
             for row in rebuilt.group_rows
         ]
 
+    @staticmethod
+    def _verified_readback_entries(
+        plan: ApprovalPlan,
+        report: ExecutionReport,
+        *,
+        plan_sha256: str,
+        verified_at: str,
+    ) -> list[dict[str, Any]]:
+        """Map only fully verified execution groups back to their exact IDs."""
+
+        groups_by_identity = {
+            (group.person, group.date): group for group in plan.groups
+        }
+        entries: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for result in report.group_results:
+            if result.verification_status != "verified_approved":
+                continue
+            group = groups_by_identity.get((result.person, result.date))
+            if group is None:
+                raise RuntimeError("verified execution result has no plan identity")
+            for approve_id in group.approve_ids:
+                if approve_id in seen_ids:
+                    raise RuntimeError("verified execution report contains a duplicate approval ID")
+                seen_ids.add(approve_id)
+                entries.append(
+                    {
+                        "approve_id": approve_id,
+                        "date": group.date,
+                        "person": group.person,
+                        "user_id": group.user_id,
+                        "verified_at": verified_at,
+                        "source": READBACK_SOURCE,
+                        "plan_sha256": plan_sha256,
+                    }
+                )
+        return entries
+
     def _run_job(self, job_id: str, ticket: PreparedTicket) -> None:
         client: Any | None = None
+        persistence_state = "pending"
+        verified_id_count = 0
         try:
             with self._state_lock:
                 job = self._jobs[job_id]
@@ -795,6 +867,7 @@ class ApprovalService:
                     job["status"] = "failed"
                     job["outcome"] = "rejected_no_change"
                     job["message"] = "归档在确认后发生变化，未创建客户端、未提交审批"
+                    job["local_persistence"] = "not_needed"
                     job["finished_at"] = _utc_now_text()
                 return
 
@@ -806,9 +879,62 @@ class ApprovalService:
                     job["status"] = "failed"
                     job["outcome"] = "rejected_no_change"
                     job["message"] = "SRDPM 登录配置不可用，未联网、未提交审批"
+                    job["local_persistence"] = "not_needed"
                     job["finished_at"] = _utc_now_text()
                 return
-            report = execute_plan(rebuilt.plan, client, allow_partial=True)
+
+            def persist_verified_readback(
+                executed_plan: ApprovalPlan, execution_report: ExecutionReport
+            ) -> None:
+                nonlocal persistence_state, verified_id_count
+                try:
+                    entries = self._verified_readback_entries(
+                        executed_plan,
+                        execution_report,
+                        plan_sha256=rebuilt.summary.sha256,
+                        verified_at=_utc_now_text(),
+                    )
+                    verified_id_count = len(entries)
+                    if not entries:
+                        persistence_state = "not_needed"
+                        return
+                    self.readback_writer(
+                        self.archive_root / executed_plan.month,
+                        executed_plan.month,
+                        entries,
+                    )
+                except Exception:
+                    # The irreversible remote result remains verified.  A local
+                    # write failure must never downgrade it to unknown or cause
+                    # an automatic resubmission.
+                    persistence_state = "failed"
+                    return
+                persistence_state = "ledger_saved"
+
+            report = execute_plan(
+                rebuilt.plan,
+                client,
+                allow_partial=True,
+                after_report=persist_verified_readback,
+            )
+            if persistence_state == "pending":
+                # The shared execution lock was unavailable, so no protected
+                # report callback ran and no remote mutation was attempted.
+                persistence_state = "not_needed"
+
+            if persistence_state == "ledger_saved":
+                with self._state_lock:
+                    self._jobs[job_id]["message"] = (
+                        "SRDPM 已回读确认通过，正在从本地审批归档重建看板"
+                    )
+                try:
+                    self.dashboard_rebuilder(self.project_dir)
+                except Exception:
+                    # The small authoritative ledger is already durable.  Keep
+                    # it even when the derived HTML cannot be rebuilt now.
+                    persistence_state = "ledger_saved"
+                else:
+                    persistence_state = "succeeded"
 
             rows_by_key = {row["group_key"]: row for row in group_results}
             # 结果本身不携带浏览器字段。服务端按完整人员身份把执行批次
@@ -850,19 +976,32 @@ class ApprovalService:
                 final_status = "failed"
                 message = "提交前校验失败，未执行审批"
 
+            if persistence_state == "succeeded":
+                message += "；本地审批归档和看板已同步"
+            elif persistence_state == "ledger_saved":
+                message += "；本地审批归档已保存，但看板重建未完成，请勿重复审批"
+            elif persistence_state == "failed":
+                message += "；本地审批状态保存失败，请勿重复审批"
+
             with self._state_lock:
                 job = self._jobs[job_id]
                 job["groups"] = copy.deepcopy(group_results)
                 job["status"] = final_status
                 job["outcome"] = report.outcome
                 job["message"] = message
+                job["local_persistence"] = persistence_state
+                job["verified_id_count"] = verified_id_count
                 job["finished_at"] = _utc_now_text()
         except ServiceError as exc:
+            if persistence_state == "pending":
+                persistence_state = "not_needed"
             with self._state_lock:
                 job = self._jobs[job_id]
                 job["status"] = "failed"
                 job["outcome"] = "rejected_no_change"
                 job["message"] = exc.message
+                job["local_persistence"] = persistence_state
+                job["verified_id_count"] = verified_id_count
                 job["finished_at"] = _utc_now_text()
         except Exception:
             with self._state_lock:
@@ -870,6 +1009,8 @@ class ApprovalService:
                 job["status"] = "failed"
                 job["outcome"] = "state_unknown"
                 job["message"] = "本机审批任务异常，请在 SRDPM 中人工核对"
+                job["local_persistence"] = persistence_state
+                job["verified_id_count"] = verified_id_count
                 job["finished_at"] = _utc_now_text()
         finally:
             if client is not None:
@@ -887,7 +1028,33 @@ class ApprovalService:
                 raise ServiceError(404, "job_not_found", "审批任务不存在")
             return copy.deepcopy(job)
 
+    def _dashboard_has_newer_readback(self) -> bool:
+        """Return whether a durable read-back is newer than the derived HTML."""
+
+        try:
+            dashboard_mtime = self.dashboard_path.stat().st_mtime_ns
+            month_dirs = tuple(self.archive_root.iterdir())
+        except OSError:
+            return False
+        for month_dir in month_dirs:
+            if not month_dir.is_dir() or not MONTH_PATTERN.fullmatch(month_dir.name):
+                continue
+            readback_path = month_dir / READBACK_FILENAME
+            try:
+                if readback_path.is_file() and readback_path.stat().st_mtime_ns > dashboard_mtime:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def render_dashboard(self) -> bytes:
+        if self._dashboard_has_newer_readback():
+            try:
+                self.dashboard_rebuilder(self.project_dir)
+            except Exception:
+                # The old page remains available and the durable ledger remains
+                # authoritative.  A later GET or full refresh can retry safely.
+                pass
         try:
             html = self.dashboard_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
@@ -1144,6 +1311,9 @@ def create_server(
     credential_client_factory: Callable[[str, str], Any] = SRDPMClient.from_credentials,
     approval_confirmer: Callable[[PlanSummary], bool] = confirm_approval_with_windows,
     refresh_runner: Callable[[Path], Any] | None = None,
+    dashboard_rebuilder: Callable[[Path], Any] | None = None,
+    readback_writer: Callable[[Path, str, Sequence[Mapping[str, Any]]], Any]
+    | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> LocalApprovalHTTPServer:
     if isinstance(port, bool) or not isinstance(port, int) or not (0 <= port <= 65_535):
@@ -1156,6 +1326,8 @@ def create_server(
         credential_client_factory=credential_client_factory,
         approval_confirmer=approval_confirmer,
         refresh_runner=refresh_runner,
+        dashboard_rebuilder=dashboard_rebuilder,
+        readback_writer=readback_writer,
         monotonic=monotonic,
     )
     return LocalApprovalHTTPServer((LISTEN_HOST, port), service)

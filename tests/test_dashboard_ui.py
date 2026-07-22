@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import build_multi_month_dashboard as dashboard
 from apply_approval_plan import load_plan, summarize_plan
+from approval_readback_store import save_approval_readback_entries
 from playwright.sync_api import sync_playwright
 
 
@@ -82,26 +83,27 @@ class DashboardUiTests(unittest.TestCase):
         for group in initial_groups or []:
             expected["id_counts"][group["group_key"]] = group["id_count"]
             expected["groups"][group["group_key"]] = group
-        dashboard_html = Path(dashboard.OUTPUT_HTML).read_text(encoding="utf-8")
+        dashboard_path = Path(dashboard.OUTPUT_HTML)
         config = {
             "api_base": "/api/v1",
             "csrf_header": "X-SRDPM-CSRF",
             "csrf_token": "test-csrf-token-with-at-least-32-characters",
             "instance_id": "test-instance",
         }
-        served_html = dashboard_html.replace(
-            "</head>",
-            '<script id="srdpm-local-service-config" type="application/json">'
-            + json.dumps(config)
-            + "</script></head>",
-            1,
-        )
+        def served_html():
+            return dashboard_path.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<script id="srdpm-local-service-config" type="application/json">'
+                + json.dumps(config)
+                + "</script></head>",
+                1,
+            )
 
         def route_local_service(route):
             request = route.request
             path = request.url.split("127.0.0.1:8765", 1)[-1]
             if path in {"/", "/index.html"}:
-                route.fulfill(status=200, content_type="text/html; charset=utf-8", body=served_html)
+                route.fulfill(status=200, content_type="text/html; charset=utf-8", body=served_html())
                 return
             requests.append(
                 {
@@ -1050,6 +1052,7 @@ class DashboardUiTests(unittest.TestCase):
                 "job_id": "test-job-id-1234567890",
                 "status": "succeeded",
                 "outcome": "succeeded",
+                "local_persistence": "succeeded",
                 "message": "done",
                 "groups": [{**group, "state": "verified_approved", "message": "verified"}],
             }
@@ -1094,6 +1097,14 @@ class DashboardUiTests(unittest.TestCase):
         self.page.wait_for_function(
             "document.querySelector('#approvalFeedback').textContent.includes('审批完成')"
         )
+        self.page.wait_for_function("approvalExecutionActive === false")
+
+        feedback = self.page.locator("#approvalFeedback").inner_text()
+        self.assertIn("本地归档已保存", feedback)
+        self.assertIn("刷新页面后仍会保留", feedback)
+        self.assertFalse(
+            any(item["path"].startswith("/api/v1/dashboard/refresh") for item in requests)
+        )
 
         prepare = next(item for item in requests if item["path"] == "/api/v1/approval/prepare")
         execute = next(item for item in requests if item["path"] == "/api/v1/approval/execute")
@@ -1116,6 +1127,214 @@ class DashboardUiTests(unittest.TestCase):
         )
         self.assert_no_page_errors()
 
+    def test_verified_readback_survives_full_page_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            month = "2026-07"
+            month_dir = project / "srdpm_archive" / month
+            month_dir.mkdir(parents=True)
+            (month_dir / "audit_report.json").write_text(
+                json.dumps(
+                    {
+                        "month": month,
+                        "platform_summary": {},
+                        "missed": {},
+                        "no_checkin_leave": [],
+                        "hours_over": [],
+                        "hours_low": [],
+                        "project_mismatch": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (month_dir / "audit_report.md").write_text("# offline\n", encoding="utf-8")
+            (month_dir / "raw_data.json").write_text(
+                json.dumps(
+                    {
+                        "daily_data": {
+                            "2026-07-08": {
+                                "list": [
+                                    {
+                                        "cn_name": "测试人员A",
+                                        "uid": "u-a",
+                                        "children": [
+                                            {
+                                                "approve_id": "91001",
+                                                "items": "G/TEST",
+                                                "title": "离线刷新回归",
+                                                "content": "仅测试本地状态持久化",
+                                                "work_hours": 4,
+                                                "status": "待审",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            old_values = (dashboard.OUT_DIR, dashboard.ARCHIVE_DIR, dashboard.OUTPUT_HTML)
+            dashboard.OUT_DIR = str(project)
+            dashboard.ARCHIVE_DIR = str(project / "srdpm_archive")
+            dashboard.OUTPUT_HTML = str(project / "dashboard.html")
+            try:
+                dashboard.main()
+                result = {"group": None, "rebuilt": False}
+
+                def job_factory():
+                    group = result["group"]
+                    if not result["rebuilt"]:
+                        save_approval_readback_entries(
+                            month_dir,
+                            month,
+                            [
+                                {
+                                    "approve_id": "91001",
+                                    "date": "2026-07-08",
+                                    "person": "测试人员A",
+                                    "user_id": "u-a",
+                                    "verified_at": "2026-07-22T03:04:05Z",
+                                    "source": "srdpm_readback",
+                                    "plan_sha256": "a" * 64,
+                                }
+                            ],
+                        )
+                        dashboard.main()
+                        result["rebuilt"] = True
+                    return {
+                        "job_id": "test-job-id-1234567890",
+                        "status": "succeeded",
+                        "outcome": "succeeded",
+                        "local_persistence": "succeeded",
+                        "message": "done",
+                        "groups": [
+                            {**group, "state": "verified_approved", "message": "verified"}
+                        ],
+                    }
+
+                _requests, expected = self.open_mock_local_service(job_factory)
+                selected = self.page.evaluate(
+                    """() => Object.values(APPROVAL_GROUPS).find(
+                        group => getGroupStatus(group.group_key) !== 'approved'
+                    )"""
+                )
+                self.assertIsNotNone(selected)
+                group_key = selected["group_key"]
+                result["group"] = {
+                    "group_key": group_key,
+                    "date": selected["date"],
+                    "person": selected["person"],
+                    "id_count": len(selected["approve_ids"]),
+                    "item_count": selected["item_count"],
+                    "work_hours": 4,
+                    "projects": ["G/TEST"],
+                    "review_summary": "六、正常申报",
+                    "review_mode": selected["review_mode"],
+                }
+                expected["id_counts"][group_key] = len(selected["approve_ids"])
+                expected["groups"][group_key] = result["group"]
+                self.page.evaluate(
+                    """key => {
+                        approvalState[key] = 'selected';
+                        saveState();
+                        renderCategoryNav();
+                        updatePendingCount();
+                    }""",
+                    group_key,
+                )
+
+                self.page.locator("#btnExecute").click()
+                self.page.wait_for_selector("#approvalConfirmOverlay.show")
+                self.page.locator("#approvalConfirmAccept").click()
+                self.page.wait_for_function(
+                    "document.querySelector('#approvalFeedback').textContent.includes('刷新页面后仍会保留')"
+                )
+                self.page.reload(wait_until="domcontentloaded")
+                self.page.wait_for_function(
+                    """key => typeof getGroupStatus === 'function' &&
+                        getGroupStatus(key) === 'approved'""",
+                    arg=group_key,
+                )
+
+                self.assertEqual(
+                    "approved",
+                    self.page.evaluate("key => getGroupStatus(key)", group_key),
+                )
+                self.assertEqual(
+                    "approved",
+                    self.page.evaluate("key => APPROVAL_GROUPS[key].status", group_key),
+                )
+                stored_state = self.page.evaluate(
+                    "key => localStorage.getItem(key)",
+                    f"srdpm_approval_v3_{month}",
+                )
+                self.assertTrue(stored_state is None or group_key not in json.loads(stored_state))
+                self.assert_no_page_errors()
+            finally:
+                dashboard.OUT_DIR, dashboard.ARCHIVE_DIR, dashboard.OUTPUT_HTML = old_values
+
+    def test_old_service_without_persistence_result_gets_version_warning(self):
+        result = {"group": None}
+
+        def job_factory():
+            return {
+                "job_id": "test-job-id-1234567890",
+                "status": "succeeded",
+                "outcome": "succeeded",
+                "message": "done",
+                "groups": [
+                    {**result["group"], "state": "verified_approved", "message": "verified"}
+                ],
+            }
+
+        _requests, expected = self.open_mock_local_service(job_factory)
+        selected = self.page.evaluate(
+            """() => Object.values(APPROVAL_GROUPS).find(value =>
+                value.review_mode === 'manual' &&
+                getGroupStatus(value.group_key) !== 'approved'
+            )"""
+        )
+        group_key = selected["group_key"]
+        result["group"] = {
+            "group_key": group_key,
+            "date": selected["date"],
+            "person": selected["person"],
+            "id_count": len(selected["approve_ids"]),
+            "item_count": selected["item_count"],
+            "work_hours": 4,
+            "projects": ["P/OLD-SERVICE"],
+            "review_summary": "三、工时异常",
+            "review_mode": selected["review_mode"],
+        }
+        expected["id_counts"][group_key] = len(selected["approve_ids"])
+        expected["groups"][group_key] = result["group"]
+        self.page.evaluate(
+            """key => {
+                approvalState[key] = 'selected';
+                saveState();
+                renderCategoryNav();
+                updatePendingCount();
+            }""",
+            group_key,
+        )
+
+        self.page.locator("#btnExecute").click()
+        self.page.wait_for_selector("#approvalConfirmOverlay.show")
+        self.page.locator("#approvalConfirmAccept").click()
+        self.page.wait_for_function(
+            "document.querySelector('#approvalFeedback').textContent.includes('后台服务版本较旧')"
+        )
+
+        feedback = self.page.locator("#approvalFeedback").inner_text()
+        self.assertNotIn("本地审批状态保存失败", feedback)
+        self.assertIn("请勿重批", feedback)
+        self.assert_no_page_errors()
+
     def test_partial_result_keeps_unknown_group_selected(self):
         result = {"rows": []}
 
@@ -1124,6 +1343,7 @@ class DashboardUiTests(unittest.TestCase):
                 "job_id": "test-job-id-1234567890",
                 "status": "failed",
                 "outcome": "partial_success",
+                "local_persistence": "succeeded",
                 "message": "partial",
                 "groups": result["rows"],
             }
@@ -1167,6 +1387,14 @@ class DashboardUiTests(unittest.TestCase):
         self.page.locator("#approvalConfirmAccept").click()
         self.page.wait_for_function(
             "document.querySelector('#approvalFeedback').textContent.includes('部分完成')"
+        )
+        self.page.wait_for_function("approvalExecutionActive === false")
+
+        feedback = self.page.locator("#approvalFeedback").inner_text()
+        self.assertIn("本地归档已保存", feedback)
+        self.assertIn("刷新页面后仍会保留", feedback)
+        self.assertFalse(
+            any(item["path"].startswith("/api/v1/dashboard/refresh") for item in requests)
         )
 
         self.assertEqual(

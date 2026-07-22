@@ -15,7 +15,7 @@
 
 1. `wiki_project_mapping.py`：只读检查固定 Wiki 页面 22824730 的最新日期版项目负荷附件，严格校验后生成当前授权映射并维护两个月撤出宽限历史。
 2. `fetch_and_audit.py`：拉取数据并基于当前、历史合理、历史过期三层人员机芯规则生成离线审计结果。
-3. `srdpm_archive/YYYY-MM/`：保存本地原始数据和审计结果；该目录是敏感运行数据，不属于源码。
+3. `srdpm_archive/YYYY-MM/`：保存本地原始数据、审计结果和仅由服务端逐 ID 回读生成的 `approval_readback.json`；该目录是敏感运行数据，不属于源码。
 4. `build_multi_month_dashboard.py`：读取审计结果并生成多月看板。
 5. `工时审批看板_多月.html`：供本地查看、选择和辅助审核的生成页面。
 6. `local_approval_server.py`：仅监听 `127.0.0.1`，同源托管看板并在用户确认后桥接真实审批。
@@ -46,6 +46,7 @@
 - 仅本机服务在重建精确白名单后可允许“所选 ID 是当天实时待审集合的子集”；命令行备用执行器继续保持整个人员日期待审集合全等校验。
 - `file://` 页面只能通过顶层导航把 `month + group_keys` 放入 localhost URL fragment；后台服务消费后必须立即清除 fragment，并以转交选择完整替换 localhost 旧选择。凭据不得进入 URL、storage、HTML、日志或反馈。
 - 提交调用抛异常时必须先只读回查，不能自动重提；只有逐 ID 回读为“通过”才能标记成功，其余必须区分 `not_attempted` 与 `unknown`。
+- 逐 ID 回读为“通过”后，服务端必须在共享审批互斥锁释放前把精确 ID、人员、日期和身份写入当月 `approval_readback.json`，再从本地归档重建看板；完整成功和部分成功都只保存 `verified_approved`，禁止保存 `unknown`、`not_attempted` 或浏览器选择。原始 `raw_data.json` 保持抓取快照语义，不得为了页面状态直接篡改。
 - 后台常驻服务的 execute 不能只信任浏览器确认；服务端必须在创建任务前显示 Windows 原生安全确认，默认选择“否”，并同时展示与网页清单一致的摘要哈希前缀。取消、弹窗不可用或摘要漂移都必须在创建客户端前停止。
 - 每周一 10:00 计划任务只能调用 `refresh_dashboard.py`，先对固定 Wiki 页面做只读附件检查，再对 SRDPM 当前月和前一月进行只读抓取、审计和页面刷新；不得调用审批、驳回、`apply_approval_plan.py` 或任何 `--execute`。刷新应使用 Credential Manager、暂存发布、刷新锁和失败保持旧页面。
 - 页面“同步 Wiki 并读取近两月”也只能经同源本机服务调用固定的 `refresh_dashboard.refresh_current_month(project_dir=...)`；接口只接受精确空 JSON `{}`，不得接收页面提供的月份、路径、Wiki URL、附件 ID、凭据、审批 ID 或脚本名。刷新期间必须拒绝新的 prepare/execute，成功后清除实际刷新两个月的旧浏览器选择并重载页面；`file://` 页面不得用 URL fragment 自动触发带凭据刷新。

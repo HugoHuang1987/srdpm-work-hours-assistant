@@ -502,6 +502,74 @@ def _refresh_file_lock(project_dir: Path) -> Iterator[None]:
             pass
 
 
+def rebuild_dashboard_from_local_archive(
+    *,
+    project_dir: Path | str = PROJECT_DIR,
+    dashboard_module: Any | None = None,
+    lock_factory: Callable[[], RefreshLockHandle | None] = try_acquire_refresh_lock,
+    execution_lock_factory: Callable[[], RefreshLockHandle | None] = _try_acquire_execution_lock,
+) -> Path:
+    """Rebuild only the generated dashboard from the published local archive.
+
+    This path performs no Wiki or SRDPM request.  It uses the same lock order as
+    the full refresh so a verified approval read-back cannot race with the
+    scheduled two-month refresh, and publishes only the derived HTML file.
+    """
+
+    if dashboard_module is None:
+        import build_multi_month_dashboard as dashboard_module
+
+    resolved_project = Path(project_dir).resolve()
+    if not resolved_project.is_dir():
+        raise RefreshError("项目目录不存在，未开始重建看板")
+
+    try:
+        lock = lock_factory()
+    except RefreshError:
+        raise
+    except Exception as exc:
+        raise RefreshError("无法获取本机刷新锁，未开始重建看板") from exc
+    if lock is None:
+        raise RefreshBusyError("已有刷新任务正在运行，本次未开始重建看板")
+
+    try:
+        try:
+            execution_lock = execution_lock_factory()
+        except Exception as exc:
+            raise RefreshError("无法获取审批执行互斥锁，未开始重建看板") from exc
+        if execution_lock is None:
+            raise RefreshBusyError("真实审批任务正在执行，本次未开始重建看板")
+
+        try:
+            with _refresh_file_lock(resolved_project):
+                with tempfile.TemporaryDirectory(
+                    prefix=".srdpm-local-build-", dir=resolved_project
+                ) as temporary_dir:
+                    stage_root = Path(temporary_dir)
+                    stage_archive = _copy_stage_snapshot(resolved_project, stage_root)
+                    try:
+                        staged_dashboard = _run_staged_dashboard(
+                            dashboard_module=dashboard_module,
+                            stage_root=stage_root,
+                            stage_archive=stage_archive,
+                        )
+                    except RefreshError:
+                        raise
+                    except Exception as exc:
+                        raise RefreshError(
+                            "本地归档看板生成失败，旧看板未修改"
+                        ) from exc
+                    target = resolved_project / DASHBOARD_NAME
+                    _publish_staged_artifacts(
+                        (_Artifact(staged_dashboard, target),), stage_root
+                    )
+                    return target
+        finally:
+            execution_lock.release()
+    finally:
+        lock.release()
+
+
 def refresh_current_month(
     *,
     project_dir: Path | str = PROJECT_DIR,

@@ -322,6 +322,77 @@ class ApprovalPlanTests(NetworkBlockedTestCase):
             self.assertEqual([], fake.status_calls)
             self.assertEqual([], fake.approve_calls)
 
+    def test_after_report_runs_exactly_once_before_execution_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            group_key = ("测试人员A", "2026-07-08")
+            fake = FakeClient(
+                pending={group_key: ["1001", "1002"]},
+                approved={group_key: {"1001": "通过", "1002": "通过"}},
+            )
+            callback_calls: list[tuple[object, object, bool]] = []
+
+            def after_report(received_plan, received_report) -> None:
+                callback_calls.append(
+                    (
+                        received_plan,
+                        received_report,
+                        self.execution_locks[-1].released,
+                    )
+                )
+
+            report = execute_plan(plan, fake, after_report=after_report)
+
+            self.assertEqual(1, len(callback_calls))
+            self.assertIs(plan, callback_calls[0][0])
+            self.assertIs(report, callback_calls[0][1])
+            self.assertFalse(callback_calls[0][2])
+            self.assertTrue(self.execution_locks[-1].released)
+
+    def test_after_report_receives_precheck_failure_before_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            fake = FakeClient(
+                pending={("测试人员A", "2026-07-08"): ["1001", "9999"]}
+            )
+            callback_reports = []
+            callback_lock_states = []
+
+            def after_report(received_plan, received_report) -> None:
+                self.assertIs(plan, received_plan)
+                callback_reports.append(received_report)
+                callback_lock_states.append(self.execution_locks[-1].released)
+
+            report = execute_plan(plan, fake, after_report=after_report)
+
+            self.assertFalse(report.success)
+            self.assertEqual("precheck", report.group_results[0].phase)
+            self.assertEqual([report], callback_reports)
+            self.assertEqual([False], callback_lock_states)
+            self.assertTrue(self.execution_locks[-1].released)
+
+    def test_after_report_exception_propagates_and_still_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = load_plan(self.write_plan(directory))
+            group_key = ("测试人员A", "2026-07-08")
+            fake = FakeClient(
+                pending={group_key: ["1001", "1002"]},
+                approved={group_key: {"1001": "通过", "1002": "通过"}},
+            )
+            callback_count = 0
+
+            def after_report(_received_plan, _received_report) -> None:
+                nonlocal callback_count
+                callback_count += 1
+                self.assertFalse(self.execution_locks[-1].released)
+                raise RuntimeError("offline persistence failure")
+
+            with self.assertRaisesRegex(RuntimeError, "offline persistence failure"):
+                execute_plan(plan, fake, after_report=after_report)
+
+            self.assertEqual(1, callback_count)
+            self.assertTrue(self.execution_locks[-1].released)
+
     def test_drift_rejects_before_any_approval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             plan = load_plan(self.write_plan(directory))

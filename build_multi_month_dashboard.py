@@ -21,6 +21,10 @@ from approval_model import (
     normalize_approve_ids,
     summarize_groups,
 )
+from approval_readback_store import (
+    load_approval_readback,
+    overlay_approval_readback,
+)
 from fetch_and_audit import (
     build_chip_norm,
     extract_chip_candidates,
@@ -113,6 +117,8 @@ def load_month_audit(month_label):
     if os.path.exists(raw_file):
         with open(raw_file, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
+        readback = load_approval_readback(month_dir, month_label)
+        raw_data = overlay_approval_readback(raw_data, readback)
 
     # Load MD for platform data
     md_file = os.path.join(month_dir, "audit_report.md")
@@ -2417,13 +2423,24 @@ async function applyApprovalJobResult(job, executionMonth) {
     const unknownRows = rows.filter(row => row.state === "unknown");
     const notAttemptedRows = rows.filter(row => row.state === "not_attempted");
     const details = unknownRows.slice(0, 5).map(row => `${row.date} ${row.person}`).join("、");
+    const localPersistence = job.local_persistence || "unknown";
+    const persistenceSucceeded = localPersistence === "succeeded";
+    const persistenceWarning = localPersistence === "ledger_saved"
+        ? "本地审批归档已保存，但当前看板文件重建未完成；F5 后若仍显示待审，请勿重批，先点“同步 Wiki 并读取近两月”或检查本机服务。"
+        : localPersistence === "failed"
+            ? "本地审批状态保存失败；请勿重复审批，并先在 SRDPM 中核对。"
+            : "后台服务版本较旧或未返回本地保存结果；SRDPM 已回读通过，请勿重批，并重启本机审批服务后核对。";
     if (job.outcome === "succeeded") {
-        setApprovalFeedback("success", `审批完成：${verifiedRows.length}条所选明细已由 SRDPM 回读确认通过。\n本页已更新；下次重新打开前请重新拉取本月数据，以同步本地归档。`);
-        // 审批后的 SRDPM 状态已回读确认，但静态看板文件仍是审批前快照。
-        // 自动执行一次只读刷新，确保整页刷新也读取最新归档。
-        await refreshDashboardData();
+        if (persistenceSucceeded) {
+            setApprovalFeedback("success", `审批完成：${verifiedRows.length}条所选明细已由 SRDPM 回读确认通过。\n本地归档已保存，刷新页面后仍会保留已审批状态。`);
+        } else {
+            setApprovalFeedback("warning", `审批完成：${verifiedRows.length}条所选明细已由 SRDPM 回读确认通过。\n${persistenceWarning}`);
+        }
     } else if (job.outcome === "partial_success") {
-        setApprovalFeedback("warning", `部分完成：${verifiedRows.length}条明细已确认通过；${unknownRows.length}条状态未知；${notAttemptedRows.length}条未尝试。${details ? `\n状态未知：${details}${unknownRows.length > 5 ? "……" : ""}` : ""}\n请人工核对未成功明细，勿直接重复点击；重新打开前请先同步本月归档。`);
+        const persistenceText = persistenceSucceeded
+            ? "本地归档已保存，刷新页面后仍会保留已确认通过的状态。"
+            : persistenceWarning;
+        setApprovalFeedback("warning", `部分完成：${verifiedRows.length}条明细已确认通过；${unknownRows.length}条状态未知；${notAttemptedRows.length}条未尝试。${details ? `\n状态未知：${details}${unknownRows.length > 5 ? "……" : ""}` : ""}\n${persistenceText}\n请人工核对未成功明细，勿直接重复点击。`);
     } else if (job.outcome === "state_unknown") {
         setApprovalFeedback("error", `审批结果存在未知状态。${details ? `请在 SRDPM 核对：${details}${unknownRows.length > 5 ? "……" : ""}` : "请到 SRDPM 人工核对。"}\n勿直接重复点击。`);
     } else {
