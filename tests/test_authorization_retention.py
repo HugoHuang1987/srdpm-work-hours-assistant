@@ -38,6 +38,67 @@ def _mapping(month, person_projects, attachment_id="1"):
 
 
 class AuthorizationRetentionPolicyTests(unittest.TestCase):
+    def test_authorization_rule_snapshot_separates_current_reasonable_and_expired(self):
+        march = _mapping(
+            "2026-03",
+            {"甲": ["G/T963D4", "G/MT9026L"]},
+        )
+        april = wiki_mapping.reconcile_authorization_retention(
+            march,
+            _mapping("2026-04", {"甲": ["G/MT9026L"]}, "2"),
+        )
+        july = wiki_mapping.reconcile_authorization_retention(
+            april,
+            _mapping("2026-07", {"甲": ["G/AM966D5"]}, "3"),
+        )
+
+        snapshot = audit.build_authorization_rule_snapshot(july, 2026, 8)
+        rules = snapshot["people"]["甲"]
+
+        self.assertEqual(1, snapshot["schema_version"])
+        self.assertEqual("2026-08", snapshot["work_month"])
+        self.assertEqual(
+            ["AM966D5"],
+            [entry["chip"] for entry in rules["current"]],
+        )
+        self.assertEqual(
+            [("MT9026L", "2026-09")],
+            [
+                (entry["chip"], entry["valid_through_month"])
+                for entry in rules["historical_reasonable"]
+            ],
+        )
+        self.assertEqual(
+            [("AM963D4", "2026-06")],
+            [
+                (entry["chip"], entry["valid_through_month"])
+                for entry in rules["historical_expired"]
+            ],
+        )
+
+    def test_current_rule_wins_over_expired_episode_for_same_canonical_chip(self):
+        march = _mapping("2026-03", {"甲": ["G/T963D5"]})
+        april = wiki_mapping.reconcile_authorization_retention(
+            march,
+            _mapping("2026-04", {"乙": ["G/AM966D5"]}, "2"),
+        )
+        august = wiki_mapping.reconcile_authorization_retention(
+            april,
+            _mapping(
+                "2026-08",
+                {"甲": ["G/AM963D5"], "乙": ["G/AM966D5"]},
+                "3",
+            ),
+        )
+
+        rules = audit.build_authorization_rule_snapshot(august, 2026, 8)[
+            "people"
+        ]["甲"]
+
+        self.assertEqual(["AM963D5"], [entry["chip"] for entry in rules["current"]])
+        self.assertEqual([], rules["historical_reasonable"])
+        self.assertEqual([], rules["historical_expired"])
+
     def test_removed_chip_is_valid_for_removal_month_and_two_following_months(self):
         previous = _mapping("2026-06", {"甲": ["G/AM963D5"]})
         current = _mapping("2026-07", {"乙": ["G/AM966D5"]}, "2")

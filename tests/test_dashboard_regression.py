@@ -1,3 +1,4 @@
+import copy
 import unittest
 from pathlib import Path
 
@@ -118,6 +119,114 @@ class CurrentArchiveRegressionTests(unittest.TestCase):
         self.assertEqual("approved", item["status"])
         self.assertEqual("", item["approve_ids"])
         self.assertIn("多条", item["approval_unavailable_reason"])
+
+    def test_month_rule_snapshot_is_copied_to_three_and_four_without_changing_approval_scope(self):
+        base_audit = {
+            "month": "2026-08",
+            "platform_summary": {},
+            "missed": {},
+            "no_checkin_leave": [],
+            "hours_over": [{
+                "date": "2026-08-03",
+                "person": "甲",
+                "reported": 8,
+                "checked": 7,
+                "leave_hours": 0,
+                "effective": 8,
+                "ratio": 8 / 7,
+            }],
+            "hours_low": [],
+            "project_mismatch": [{
+                "date": "2026-08-03",
+                "person": "甲",
+                "customer": "G",
+                "items": "P-01",
+                "title": "项目归属异常",
+                "content": "离线规则列测试",
+                "work_hours": 8,
+                "chip_candidates": ["AM963D5"],
+                "allowed_chips": ["AM966D5", "MT9026L"],
+                "reason": "测试异常",
+            }],
+        }
+        raw = {
+            "daily_data": {
+                "2026-08-03": {
+                    "list": [{
+                        "cn_name": "甲",
+                        "children": [{
+                            "approve_id": "rule-columns-1",
+                            "items": "P-01",
+                            "title": "项目归属异常",
+                            "content": "离线规则列测试",
+                            "work_hours": 8,
+                            "status": "待审",
+                        }],
+                    }]
+                }
+            }
+        }
+        audit_with_rules = copy.deepcopy(base_audit)
+        audit_with_rules["authorization_rules"] = {
+            "schema_version": 1,
+            "work_month": "2026-08",
+            "people": {
+                "甲": {
+                    "current": [{"chip": "AM966D5", "canonical_chip": "AM966D5", "customers": ["G"]}],
+                    "historical_reasonable": [{
+                        "chip": "MT9026L",
+                        "canonical_chip": "MT9026L",
+                        "removed_month": "2026-07",
+                        "valid_through_month": "2026-09",
+                    }],
+                    "historical_expired": [{
+                        "chip": "AM963D4",
+                        "canonical_chip": "AM963D4",
+                        "removed_month": "2026-04",
+                        "valid_through_month": "2026-06",
+                    }],
+                }
+            },
+        }
+
+        cats_without = dashboard.build_category_data(base_audit, "", raw)
+        cats_with = dashboard.build_category_data(audit_with_rules, "", raw)
+
+        for key in ("three", "four"):
+            item = cats_with[key]["items"][0]
+            self.assertTrue(item["authorization_rules_recorded"])
+            self.assertTrue(item["authorization_person_listed"])
+            self.assertEqual(["AM966D5"], [entry["chip"] for entry in item["current_rules"]])
+            self.assertEqual(
+                [("MT9026L", "2026-09")],
+                [(entry["chip"], entry["valid_through_month"]) for entry in item["historical_reasonable_rules"]],
+            )
+            self.assertEqual(
+                [("AM963D4", "2026-06")],
+                [(entry["chip"], entry["valid_through_month"]) for entry in item["historical_expired_rules"]],
+            )
+
+        for key in ("three", "four"):
+            missing = cats_without[key]["items"][0]
+            self.assertFalse(missing["authorization_rules_recorded"])
+            self.assertFalse(missing["authorization_person_listed"])
+            self.assertEqual([], missing["current_rules"])
+            self.assertEqual([], missing["historical_reasonable_rules"])
+            self.assertEqual([], missing["historical_expired_rules"])
+
+        self.assertEqual(
+            manual_pairs_from_categories(cats_without),
+            manual_pairs_from_categories(cats_with),
+        )
+        groups_without = build_approval_groups(raw, categories=cats_without)
+        groups_with = build_approval_groups(raw, categories=cats_with)
+        self.assertEqual(groups_without, groups_with)
+
+        audit_with_rules["authorization_rules"]["people"] = {}
+        unlisted = dashboard.build_category_data(audit_with_rules, "", raw)
+        for key in ("three", "four"):
+            self.assertTrue(unlisted[key]["items"][0]["authorization_rules_recorded"])
+            self.assertFalse(unlisted[key]["items"][0]["authorization_person_listed"])
 
     def test_july_dedup_and_assignment_invariants(self):
         raw, cats, groups = self.load_month("2026-07")

@@ -390,6 +390,111 @@ class DashboardUiTests(unittest.TestCase):
             self.assertEqual(expected_visible, self.page.locator(f"#panel_{key} .table-wrap tbody tr:visible").count(), key)
         self.assert_no_page_errors()
 
+    def test_three_and_four_show_separate_authorization_rule_columns(self):
+        self.page.evaluate(
+            """() => {
+                window.__ruleXss = 0;
+                const rules = {
+                    authorization_rules_recorded: true,
+                    current_rules: [
+                        {chip: 'AM966D5'},
+                        {chip: '<img data-rule-xss="1" src=x onerror="window.__ruleXss=1">'}
+                    ],
+                    historical_reasonable_rules: [
+                        {chip: 'AM963D5', valid_through_month: '2026-09'},
+                        {chip: 'MT9026L', valid_through_month: '2026-10'}
+                    ],
+                    historical_expired_rules: [
+                        {chip: 'AM963D4', valid_through_month: '2026-06'}
+                    ]
+                };
+                CAT_DATA.three = {title: '三、工时异常', items: [{
+                    date: '2026-08-03', person: '甲', subtype: '低申报',
+                    reported: 4, checked: 8, leave: 0, effective: 4, ratio: '50%',
+                    detail: '测试', status: 'pending', ...rules
+                }]};
+                CAT_DATA.four = {title: '四、项目归属异常', items: [
+                    {date: '2026-08-03', person: '甲', customer: 'G', items: 'P-01',
+                     title: '测试', content: '测试', hours: 4, chip: 'AM963D5',
+                     reason: '异常', status: 'pending', ...rules},
+                    {date: '2026-08-04', person: '旧归档人员', customer: 'G', items: 'P-02',
+                     title: '旧归档', content: '旧归档', hours: 4, chip: 'MT1',
+                     reason: '异常', status: 'pending', authorization_rules_recorded: false,
+                     authorization_person_listed: false, current_rules: [],
+                     historical_reasonable_rules: [], historical_expired_rules: []},
+                    {date: '2026-08-05', person: 'Wiki缺失人员', customer: 'G', items: 'P-03',
+                     title: '人员缺失', content: '人员缺失', hours: 4, chip: 'MT2',
+                     reason: '异常', status: 'pending', authorization_rules_recorded: true,
+                     authorization_person_listed: false, current_rules: [],
+                     historical_reasonable_rules: [], historical_expired_rules: []}
+                ]};
+                APPROVAL_GROUPS = {};
+                approvalState = {};
+                resetAllPageState();
+                switchTab('three');
+            }"""
+        )
+
+        self.assertEqual(
+            [
+                "日期", "人员", "当前规则机芯", "历史合理机芯", "历史过期机芯",
+                "类型", "申报(h)", "打卡(h)", "休假(h)", "有效申报(h)",
+                "比例", "工作内容", "审核状态", "操作",
+            ],
+            self.page.locator("#panel_three thead th").all_inner_texts(),
+        )
+        three_text = self.page.locator("#panel_three tbody").inner_text()
+        self.assertIn("AM966D5", three_text)
+        self.assertIn("AM963D5（有效至 2026-09）", three_text)
+        self.assertIn("MT9026L（有效至 2026-10）", three_text)
+        self.assertIn("AM963D4（已于 2026-06 到期）", three_text)
+        self.assertEqual(0, self.page.evaluate("window.__ruleXss"))
+        self.assertEqual(0, self.page.locator("img[data-rule-xss='1']").count())
+
+        self.page.evaluate("switchTab('four')")
+        self.assertEqual(
+            [
+                "日期 ⇅", "人员", "客户", "项目代码 ⇅", "标题", "工作内容", "工时", "机芯 ⇅",
+                "当前规则机芯", "历史合理机芯", "历史过期机芯", "问题", "审核状态", "操作",
+            ],
+            self.page.locator("#panel_four thead th").all_inner_texts(),
+        )
+        four_text = self.page.locator("#panel_four tbody").inner_text()
+        self.assertIn("旧归档未记录（需重新审计该月）", four_text)
+        self.assertIn("Wiki 未列此人", four_text)
+        self.assertNotIn("undefined", four_text)
+        self.assertNotIn("null", four_text)
+        self.assertEqual(0, self.page.evaluate("window.__ruleXss"))
+        self.assertEqual(0, self.page.locator("img[data-rule-xss='1']").count())
+        self.assert_no_page_errors()
+
+    def test_three_rule_columns_do_not_break_type_and_person_filters(self):
+        self.page.evaluate(
+            """() => {
+                const rules = {
+                    authorization_rules_recorded: true,
+                    current_rules: [{chip: 'AM966D5'}],
+                    historical_reasonable_rules: [],
+                    historical_expired_rules: []
+                };
+                CAT_DATA.three = {title: '三、工时异常', items: [
+                    {date: '2026-08-01', person: '甲', subtype: '低申报', reported: 1,
+                     checked: 2, leave: 0, effective: 1, ratio: '50%', detail: '', status: 'pending', ...rules},
+                    {date: '2026-08-02', person: '乙', subtype: '超打卡', reported: 3,
+                     checked: 2, leave: 0, effective: 3, ratio: '150%', detail: '', status: 'pending', ...rules}
+                ]};
+                APPROVAL_GROUPS = {};
+                approvalState = {};
+                resetAllPageState();
+                switchTab('three');
+            }"""
+        )
+        self.page.locator("#filter_subtype").select_option("低申报")
+        self.page.locator("#filter_person3").select_option("甲")
+        self.assertEqual(1, self.page.locator("#panel_three tbody tr:visible").count())
+        self.assertIn("甲", self.page.locator("#panel_three tbody tr:visible").inner_text())
+        self.assert_no_page_errors()
+
     def test_ui_refresh_uses_read_only_endpoint_and_clears_both_refreshed_months(self):
         self.assertGreaterEqual(len(self.available_months), 3)
         previous_month = self.available_months[-2]
@@ -407,7 +512,9 @@ class DashboardUiTests(unittest.TestCase):
         )
         group_key = self.page.evaluate(
             """months => {
-                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                const group = Object.values(APPROVAL_GROUPS).find(value =>
+                    value.review_mode === 'manual' && getGroupStatus(value.group_key) !== 'approved'
+                );
                 months.forEach(month => {
                     localStorage.setItem(getStorageKey(month), JSON.stringify({[group.group_key]: 'selected'}));
                 });
@@ -542,7 +649,7 @@ class DashboardUiTests(unittest.TestCase):
 
     def test_local_service_consumes_handoff_once_and_replaces_stale_selection(self):
         groups = self.page.evaluate(
-            "Object.values(APPROVAL_GROUPS).filter(group => group.review_mode === 'manual').slice(0, 2)"
+            "Object.values(APPROVAL_GROUPS).filter(group => group.review_mode === 'manual' && getGroupStatus(group.group_key) !== 'approved').slice(0, 2)"
         )
         selected, stale = groups
         transfer_url = self.page.evaluate(
@@ -599,7 +706,9 @@ class DashboardUiTests(unittest.TestCase):
         )
         selected = self.page.evaluate(
             """() => {
-                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                const group = Object.values(APPROVAL_GROUPS).find(value =>
+                    value.review_mode === 'manual' && getGroupStatus(value.group_key) !== 'approved'
+                );
                 approvalState[group.group_key] = 'selected';
                 saveState();
                 updatePendingCount();
@@ -671,7 +780,9 @@ class DashboardUiTests(unittest.TestCase):
         )
         self.page.evaluate(
             """() => {
-                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                const group = Object.values(APPROVAL_GROUPS).find(value =>
+                    value.review_mode === 'manual' && getGroupStatus(value.group_key) !== 'approved'
+                );
                 approvalState[group.group_key] = 'selected';
                 saveState();
                 updatePendingCount();
@@ -928,7 +1039,9 @@ class DashboardUiTests(unittest.TestCase):
         requests, expected = self.open_mock_local_service(job_factory)
         selected = self.page.evaluate(
             """() => {
-                const group = Object.values(APPROVAL_GROUPS).find(value => value.review_mode === 'manual');
+                const group = Object.values(APPROVAL_GROUPS).find(value =>
+                    value.review_mode === 'manual' && getGroupStatus(value.group_key) !== 'approved'
+                );
                 approvalState[group.group_key] = 'selected';
                 saveState();
                 renderCategoryNav();

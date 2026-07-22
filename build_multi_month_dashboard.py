@@ -129,6 +129,55 @@ def build_category_data(data, md_text, raw_data=None):
 
     raw_children = iter_unique_children(raw_data)
     known_chips = load_known_chip_codes()
+    rule_snapshot = data.get("authorization_rules")
+    audit_month = str(data.get("month") or "").strip()
+    snapshot_month = (
+        str(rule_snapshot.get("work_month") or "").strip()
+        if isinstance(rule_snapshot, dict)
+        else ""
+    )
+    rule_people = (
+        rule_snapshot.get("people", {})
+        if isinstance(rule_snapshot, dict)
+        and rule_snapshot.get("schema_version") == 1
+        and snapshot_month
+        and (not audit_month or snapshot_month == audit_month)
+        and isinstance(rule_snapshot.get("people"), dict)
+        else None
+    )
+
+    def authorization_rule_columns(person):
+        if rule_people is None:
+            return {
+                "authorization_rules_recorded": False,
+                "authorization_person_listed": False,
+                "current_rules": [],
+                "historical_reasonable_rules": [],
+                "historical_expired_rules": [],
+            }
+        person_rules = rule_people.get(person)
+        if not isinstance(person_rules, dict):
+            return {
+                "authorization_rules_recorded": True,
+                "authorization_person_listed": False,
+                "current_rules": [],
+                "historical_reasonable_rules": [],
+                "historical_expired_rules": [],
+            }
+
+        def safe_entries(key):
+            entries = person_rules.get(key, [])
+            if not isinstance(entries, list):
+                return []
+            return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+        return {
+            "authorization_rules_recorded": True,
+            "authorization_person_listed": True,
+            "current_rules": safe_entries("current"),
+            "historical_reasonable_rules": safe_entries("historical_reasonable"),
+            "historical_expired_rules": safe_entries("historical_expired"),
+        }
 
     def determine_status(date, person, items=None, title=None):
         """根据 raw_data 判断该异常条目在 SRDPM 系统上的真实状态"""
@@ -354,6 +403,7 @@ def build_category_data(data, md_text, raw_data=None):
         cats["three"]["items"].append({
             "date": entry["date"],
             "person": entry["person"],
+            **authorization_rule_columns(entry["person"]),
             "subtype": subtype,
             "reported": entry["reported"],
             "checked": entry["checked"],
@@ -371,6 +421,7 @@ def build_category_data(data, md_text, raw_data=None):
         cats["three"]["items"].append({
             "date": entry["date"],
             "person": entry["person"],
+            **authorization_rule_columns(entry["person"]),
             "subtype": "低申报",
             "reported": entry["reported"],
             "checked": entry["checked"],
@@ -438,6 +489,7 @@ def build_category_data(data, md_text, raw_data=None):
         cats["four"]["items"].append({
             "date": entry["date"],
             "person": entry["person"],
+            **authorization_rule_columns(entry["person"]),
             "customer": entry.get("customer", ""),
             "items": entry.get("items", ""),
             "title": entry.get("title", ""),
@@ -913,6 +965,15 @@ body.approval-busy .btn-refresh-dashboard { pointer-events: none; opacity: .55; 
 .status-badge.approved { background: #e6f7e6; color: #1a7a1a; border: 1px solid #b7e4b7; }
 .status-badge.pending { background: #fff3e0; color: #e65100; border: 1px solid #ffcc80; }
 .status-badge.selected { background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9; }
+.rule-list { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 145px; }
+.rule-badge { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 12px; line-height: 1.45; white-space: nowrap; }
+.rule-badge.current { color: #1b5e20; background: #e8f5e9; border: 1px solid #a5d6a7; }
+.rule-badge.reasonable { color: #9a5700; background: #fff3e0; border: 1px solid #ffcc80; }
+.rule-badge.expired { color: #8a3030; background: #f5eeee; border: 1px solid #d8bcbc; }
+.rule-empty, .rule-unrecorded, .rule-person-unlisted { color: #888; font-size: 12px; white-space: nowrap; }
+.rule-unrecorded { color: #9a5700; }
+.rule-person-unlisted { color: #b23b3b; font-weight: 600; }
+.rule-legend { margin: -5px 0 14px; padding: 8px 12px; border: 1px solid #e4e7ed; border-radius: 7px; background: #fbfcfe; color: #666; font-size: 12px; }
 .bulk-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; padding: 10px 12px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e8e8e8; }
 .bulk-actions button { padding: 6px 12px; border-radius: 5px; cursor: pointer; }
 .bulk-note { font-size: 12px; color: #e65100; }
@@ -1562,6 +1623,9 @@ function renderPanel(key) {
 
     let html = `<div class="panel active" id="panel_${key}">`;
     html += `<div class="panel-desc">${escapeHtml(cat.desc || cat.subtitle || "")}</div>`;
+    if (key === "three" || key === "four") {
+        html += '<div class="rule-legend">当前规则机芯＝本次审计时的最新 Wiki；历史合理机芯＝该工时月仍在撤出后的两个月宽限期；历史过期机芯＝仅供追溯，不会据此放行。“Wiki 未列此人”表示最新附件没有该人员；“旧归档未记录”表示当月归档尚无规则快照。</div>';
+    }
     if (key !== "zero") html += renderBulkActions(key);
 
     if (cat.items.length === 0) {
@@ -1601,6 +1665,41 @@ function renderSummaryZero(cat) {
     </div>${renderHoursSummary6(items, getFilteredIndices("zero"))}</div>`;
 }
 
+function renderAuthorizationRuleCell(item, field) {
+    if (item.authorization_rules_recorded !== true) {
+        return '<td class="rule-cell"><span class="rule-unrecorded">旧归档未记录（需重新审计该月）</span></td>';
+    }
+    if (item.authorization_person_listed === false) {
+        if (field === "current_rules") {
+            return '<td class="rule-cell"><span class="rule-person-unlisted">Wiki 未列此人</span></td>';
+        }
+        return '<td class="rule-cell"><span class="rule-empty">—</span></td>';
+    }
+    const entries = Array.isArray(item[field]) ? item[field] : [];
+    if (entries.length === 0) {
+        return '<td class="rule-cell"><span class="rule-empty">—</span></td>';
+    }
+    const kind = field === "current_rules"
+        ? "current"
+        : (field === "historical_reasonable_rules" ? "reasonable" : "expired");
+    const labels = entries.map(entry => {
+        const chip = String(entry?.chip ?? "").trim();
+        if (!chip) return "";
+        if (kind === "current") return chip;
+        const validThrough = String(entry?.valid_through_month ?? "").trim();
+        if (!validThrough) return chip;
+        return kind === "reasonable"
+            ? `${chip}（有效至 ${validThrough}）`
+            : `${chip}（已于 ${validThrough} 到期）`;
+    }).filter(Boolean);
+    if (labels.length === 0) {
+        return '<td class="rule-cell"><span class="rule-empty">—</span></td>';
+    }
+    return `<td class="rule-cell"><div class="rule-list">${labels.map(label =>
+        `<span class="rule-badge ${kind}">${escapeHtml(label)}</span>`
+    ).join("")}</div></td>`;
+}
+
 function renderTable(key, cat) {
     const items = cat.items;
     if (items.length === 0) return "";
@@ -1613,11 +1712,11 @@ function renderTable(key, cat) {
         cols = ["date", "person", "project", "title", "content", "hours", "status", "action"];
         headers = ["日期", "人员", "项目", "标题", "工作内容", "工时", "审批状态", "操作"];
     } else if (key === "three") {
-        cols = ["date", "person", "subtype", "reported", "checked", "leave", "effective", "ratio", "detail", "status", "action"];
-        headers = ["日期", "人员", "类型", "申报(h)", "打卡(h)", "休假(h)", "有效申报(h)", "比例", "工作内容", "审核状态", "操作"];
+        cols = ["date", "person", "current_rules", "historical_reasonable_rules", "historical_expired_rules", "subtype", "reported", "checked", "leave", "effective", "ratio", "detail", "status", "action"];
+        headers = ["日期", "人员", "当前规则机芯", "历史合理机芯", "历史过期机芯", "类型", "申报(h)", "打卡(h)", "休假(h)", "有效申报(h)", "比例", "工作内容", "审核状态", "操作"];
     } else if (key === "four") {
-        cols = ["date", "person", "customer", "items", "title", "content", "hours", "chip", "allowed", "reason", "status", "action"];
-        headers = ["日期", "人员", "客户", "项目代码", "标题", "工作内容", "工时", "机芯", "允许机芯", "问题", "审核状态", "操作"];
+        cols = ["date", "person", "customer", "items", "title", "content", "hours", "chip", "current_rules", "historical_reasonable_rules", "historical_expired_rules", "reason", "status", "action"];
+        headers = ["日期", "人员", "客户", "项目代码", "标题", "工作内容", "工时", "机芯", "当前规则机芯", "历史合理机芯", "历史过期机芯", "问题", "审核状态", "操作"];
     } else if (key === "five") {
         cols = ["date", "person", "project", "title", "content", "hours", "status", "action"];
         headers = ["日期", "人员", "项目", "标题", "工作内容", "工时", "审批状态", "操作"];
@@ -1703,11 +1802,12 @@ function renderTable(key, cat) {
     for (let headerIndex = 0; headerIndex < headers.length; headerIndex++) {
         const h = headers[headerIndex];
         const field = cols[headerIndex];
-        const sortable = (key === "four" || key === "six") && ["date", "project", "chip"].includes(field);
+        const sortField = key === "four" && field === "items" ? "project" : field;
+        const sortable = (key === "four" || key === "six") && ["date", "project", "chip"].includes(sortField);
         if (sortable) {
             const currentSort = pageState[key]?.sort || "";
-            const arrow = currentSort === `${field}_asc` ? " ▲" : (currentSort === `${field}_desc` ? " ▼" : " ⇅");
-            tableHtml += `<th><button class="sortable-header" type="button" onclick="toggleSort('${key}', '${field}')">${h}${arrow}</button></th>`;
+            const arrow = currentSort === `${sortField}_asc` ? " ▲" : (currentSort === `${sortField}_desc` ? " ▼" : " ⇅");
+            tableHtml += `<th><button class="sortable-header" type="button" onclick="toggleSort('${key}', '${sortField}')">${h}${arrow}</button></th>`;
         } else {
             tableHtml += `<th>${h}</th>`;
         }
@@ -1765,6 +1865,8 @@ function renderTable(key, cat) {
                     const btnText = isManualGroup ? `标记${scope}通过` : `⭐ 选择${scope}`;
                     tableHtml += `<td class="nowrap"><button class="btn-approve" onclick="toggleApproval('${key}', ${i})">${btnText}</button></td>`;
                 }
+            } else if (["current_rules", "historical_reasonable_rules", "historical_expired_rules"].includes(col)) {
+                tableHtml += renderAuthorizationRuleCell(item, col);
             } else if (col === "detail" || col === "content" || col === "missed_dates") {
                 const rawVal = String(item[col] ?? "");
                 const displayVal = rawVal.length > 80 ? rawVal.substring(0, 80) + "..." : rawVal;
@@ -2424,11 +2526,10 @@ function refilterThree() {
     const rows = document.querySelectorAll("#panel_three tbody tr");
     let count = 0;
     rows.forEach(row => {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 3) return;
-        const rowSubtype = cells[2]?.textContent || "";
-        const rowPerson = cells[1]?.textContent || "";
         const rowIndex = Number(row.id.split("_").pop());
+        const item = CAT_DATA.three?.items?.[rowIndex] || {};
+        const rowSubtype = String(item.subtype || "");
+        const rowPerson = String(item.person || "");
         const pendingMatch = !pageState.three?.pendingOnly || getStatus("three", rowIndex) !== "approved";
         const match = pendingMatch && (subtype === "all" || rowSubtype.includes(subtype)) && (person === "all" || rowPerson.includes(person));
         row.style.display = match ? "" : "none";

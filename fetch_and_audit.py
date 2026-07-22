@@ -628,6 +628,128 @@ def authorization_retention_status(mapping_data, year, month):
     return active, expired
 
 
+def _build_authorization_rule_snapshot(
+    mapping_data,
+    year,
+    month,
+    active_records,
+    expired_records,
+):
+    """固化某个工时月份的人员机芯规则，供归档看板稳定回看。"""
+
+    try:
+        from wiki_project_mapping import canonical_chip_key, mapping_entry_chip
+    except ImportError as exc:
+        raise ValueError('机芯规则快照组件不可用') from exc
+
+    person_projects = mapping_data.get('person_projects')
+    if not isinstance(person_projects, dict):
+        raise ValueError('人员机芯映射格式异常')
+
+    people = {
+        str(person).strip()
+        for person in mapping_data.get('all_people', [])
+        if str(person).strip()
+    }
+    people.update(str(person).strip() for person in person_projects if str(person).strip())
+    people.update(str(person).strip() for person in active_records if str(person).strip())
+    people.update(str(person).strip() for person in expired_records if str(person).strip())
+
+    current_by_person = {}
+    current_keys_by_person = {}
+    for raw_person, raw_entries in person_projects.items():
+        person = str(raw_person).strip()
+        if not person or not isinstance(raw_entries, list):
+            raise ValueError('人员机芯映射内容异常')
+        grouped = {}
+        for value in raw_entries:
+            chip = mapping_entry_chip(value)
+            canonical = canonical_chip_key(chip)
+            customer, _chip = _split_project_mapping_entry(value)
+            entry = grouped.setdefault(
+                canonical,
+                {
+                    'chip': canonical,
+                    'canonical_chip': canonical,
+                    'customers': [],
+                },
+            )
+            customer = customer.strip()
+            if customer and customer not in entry['customers']:
+                entry['customers'].append(customer)
+        for entry in grouped.values():
+            entry['customers'].sort()
+        current_by_person[person] = sorted(
+            grouped.values(), key=lambda item: item['chip']
+        )
+        current_keys_by_person[person] = set(grouped)
+
+    def historical_for(person, records, excluded_keys):
+        result = []
+        seen = set()
+        for record in records.get(person, []):
+            canonical = str(record.get('canonical_chip') or '').strip().upper()
+            if not canonical or canonical in excluded_keys or canonical in seen:
+                continue
+            seen.add(canonical)
+            result.append({
+                'chip': canonical,
+                'canonical_chip': canonical,
+                'valid_from_month': record.get('valid_from_month'),
+                'removed_month': record.get('removed_month'),
+                'valid_through_month': record.get('valid_through_month'),
+            })
+        return sorted(
+            result,
+            key=lambda item: (item['chip'], item.get('valid_through_month') or ''),
+        )
+
+    snapshot_people = {}
+    for person in sorted(people, key=lambda value: (len(value), value)):
+        current = current_by_person.get(person, [])
+        current_keys = set(current_keys_by_person.get(person, set()))
+        reasonable = historical_for(person, active_records, current_keys)
+        reasonable_keys = {entry['canonical_chip'] for entry in reasonable}
+        expired = historical_for(
+            person,
+            expired_records,
+            current_keys | reasonable_keys,
+        )
+        snapshot_people[person] = {
+            'current': current,
+            'historical_reasonable': reasonable,
+            'historical_expired': expired,
+        }
+
+    source = mapping_data.get('source')
+    mapping_source = {}
+    if isinstance(source, dict):
+        for key in ('attachment_id', 'filename', 'updated_at', 'sha256', 'sheet'):
+            value = source.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                mapping_source[key] = value
+
+    return {
+        'schema_version': 1,
+        'work_month': f'{int(year):04d}-{int(month):02d}',
+        'mapping_source': mapping_source,
+        'people': snapshot_people,
+    }
+
+
+def build_authorization_rule_snapshot(mapping_data, year, month):
+    """返回按工时月份固化且三类互斥的人员机芯规则快照。"""
+
+    active, expired = authorization_retention_status(mapping_data, year, month)
+    return _build_authorization_rule_snapshot(
+        mapping_data,
+        year,
+        month,
+        active,
+        expired,
+    )
+
+
 def active_authorization_retention(mapping_data, year, month):
     """返回对指定工时月份仍有效的历史合理规则。"""
 
@@ -876,6 +998,13 @@ def run_audit(year, month, fetch_result):
     # 始终保持最新 Wiki 的严格快照。
     grace_records, expired_grace_records = authorization_retention_status(
         mapping_data, year, month
+    )
+    authorization_rules = _build_authorization_rule_snapshot(
+        mapping_data,
+        year,
+        month,
+        grace_records,
+        expired_grace_records,
     )
 
     # 历史机芯只用于识别和解释，不参与当前人员授权判定。先校验完人员
@@ -1148,6 +1277,7 @@ def run_audit(year, month, fetch_result):
         'leader_issues': findings['leader_issues'],
         'platform_summary': {k: v for k, v in findings['platform_summary'].items()},
         'daily_summary': findings['daily_summary'],
+        'authorization_rules': authorization_rules,
     }
     json_file = os.path.join(month_dir, "audit_report.json")
     with open(json_file, 'w', encoding='utf-8') as f:
